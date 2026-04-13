@@ -1,0 +1,97 @@
+# SIPReaper Configuration
+# Copy this file to /etc/sipreaper/config.yaml and adjust as needed.
+
+# Ingest
+ingest:
+  log:
+    enabled: true
+    path: "/var/log/kamailio/kamailio.log"
+    format: "kamailio"           # kamailio | opensips | custom
+    custom_patterns: []
+  syslog:
+    enabled: false
+    listen: "0.0.0.0:1514"
+  pcap:
+    enabled: true
+    interface: "eth0"
+    ports: [5060, 5061]
+    bpf_filter: ""
+
+# Detection
+detectors:
+  brute_force:
+    enabled: true
+    max_attempts: 5
+    window: 60s
+  invite_flood:
+    enabled: true
+    max_requests: 50
+    window: 10s
+  scanner:
+    enabled: true
+    max_probes: 10
+    window: 30s
+    known_agents: ["friendly-scanner", "sipcli", "sipvicious"]
+  invalid_request:
+    enabled: true
+    max_invalid: 3
+    window: 60s
+  geo_anomaly:
+    enabled: true
+    allowed_countries: ["GB", "US"]
+    geoip_db: "/usr/share/GeoIP/GeoLite2-Country.mmdb"
+  user_enum:
+    enabled: true
+    max_extensions: 10
+    window: 60s
+
+# Whitelist
+whitelist:
+  static:
+    - ip: "10.0.0.0/8"
+      comment: "Internal network"
+    - ip: "172.16.0.0/12"
+      comment: "Internal network"
+    - ip: "192.168.0.0/16"
+      comment: "Internal network"
+
+# Bans
+bans:
+  durations: [5m, 30m, 2h, 24h, 0]
+  cooldown: 48h
+  check_interval: 30s
+
+# Enforcement
+enforcer:
+  type: "iptables"
+  chain: "SIPREAPER"
+
+# Notifications
+notifiers:
+  syslog:
+    enabled: true
+  email:
+    enabled: true
+    smtp_host: "smtp.example.com"
+    smtp_port: 587
+    tls: true
+    from: "sipreaper@example.com"
+    to: ["admin@example.com"]
+    username: "sipreaper@example.com"
+    password_env: "SIPREAPER_SMTP_PASS"
+    min_severity: "medium"
+
+# API
+api:
+  listen: "127.0.0.1:8080"
+  token_env: "SIPREAPER_API_TOKEN"
+
+# Storage
+storage:
+  path: "/var/lib/sipreaper/sipreaper.db"
+
+# Logging
+logging:
+  level: "info"
+  output: "stdout"
+  file: "/var/log/sipreaper/sipreaper.log"
