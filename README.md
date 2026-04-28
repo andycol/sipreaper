@@ -4,15 +4,18 @@ SIP attack detection and automatic IP banning for Kamailio and OpenSIPS. Think f
 
 ## Features
 
-- **Dual ingest** — monitors both log files and live packet capture simultaneously
-- **6 detection engines** — brute force, INVITE flood, scanner detection, invalid requests, geo-anomaly, user enumeration
+- **Dual ingest** — log files (kamailio + opensips formats, auto-cascade) and live packet capture
+- **10 detection engines** — brute force, INVITE flood, scanner, invalid requests, geo-anomaly, user enumeration, **server_rejected**, **honeypot**, **failed_call_ratio**, **did_scanner**
+- **Pcap response pairing** — 4xx responses are attributed back to the original sender via Call-ID, so SIP-server rejections become high-confidence threats automatically
 - **Configurable thresholds** — per-detector enable/disable, rate limits, and time windows
-- **Two-tier whitelist** — static (config file) and dynamic (runtime via CLI/API), supports IPs and CIDRs
+- **Two-tier whitelist** — static (config file) and dynamic (runtime via CLI/API), supports IPs and CIDRs, with guards against accidentally banning whitelisted IPs and against whitelisting still-banned IPs
 - **Escalating bans** — repeat offenders get progressively longer bans (5m → 30m → 2h → 24h → permanent)
-- **Pluggable enforcement** — iptables out of the box, interface-based for adding nftables or others
+- **Pluggable enforcement** — `iptables` and `ipset` (O(1) lookup), with optional **kernel-side INVITE pre-filter** (`hashlimit`) to absorb floods before userspace
 - **Pluggable notifications** — syslog and email (SMTP) built-in, with severity filtering
-- **REST API** — full management API with bearer token auth
-- **CLI** — `sipreaper` command for all operations (talks to the API)
+- **Dry-run / shadow mode** — record would-be bans without touching the firewall, for safe threshold tuning against real traffic
+- **REST API + CLI** — full management API with bearer token auth (constant-time compare); the `sipreaper` CLI wraps every operation, plus `sipreaper test-line` for diagnosing log lines
+- **Observability** — Prometheus `/metrics`, unauthenticated `/healthz`, structured (JSON) logging via zerolog, sampled debug log of unmatched lines
+- **Hardened internals** — bounded pcap inflight map (DoS-resistant), goroutine panic recovery, SQLite WAL + busy timeout, config validation at startup
 - **SQLite persistence** — bans, events, and whitelist survive restarts
 - **SIGHUP reload** — reload config without restarting the daemon
 
@@ -139,6 +142,33 @@ detectors:
     enabled: true
     max_extensions: 10       # distinct To-User targets before ban
     window: 60s
+
+  # The SIP server's own rejection signal — the highest-confidence threat there
+  # is. Catches things like "Rejected inbound carrier INVITE from non-whitelisted
+  # source 1.2.3.4 for DID …" with a single hit.
+  server_rejected:
+    enabled: true
+    max_hits: 1
+    window: 5m
+
+  # Decoy extensions / DIDs no real user dials. First request to any of these
+  # bans the source. Zero false positives.
+  honeypot:
+    enabled: false
+    extensions: ["1000", "0000", "admin", "test"]
+
+  # Toll-fraud reconnaissance: high failure rate on outbound INVITEs from one IP.
+  failed_call_ratio:
+    enabled: false
+    min_calls: 20            # need this many INVITEs in window before evaluating
+    min_ratio: 0.8           # 80%+ failed = threat
+    window: 5m
+
+  # One IP reaching for many distinct DIDs in a short window — dial-plan probing.
+  did_scanner:
+    enabled: false
+    max_dids: 20
+    window: 5m
 ```
 
 **Detector details:**
@@ -151,6 +181,15 @@ detectors:
 | `invalid_request` | Unknown SIP methods or empty method field | 3 in 60s | medium |
 | `geo_anomaly` | Requests from countries not in the allowed list | any | medium |
 | `user_enum` | Distinct To-User (extension) targets from one IP | 10 in 60s | high |
+| `server_rejected` | SIP server emitted a 4xx / "rejected" log line for this source | 1 in 5m | high |
+| `honeypot` | Traffic to a configured decoy extension | 1 hit | high |
+| `failed_call_ratio` | High failed:total INVITE ratio over a meaningful sample | 80% of 20 in 5m | high |
+| `did_scanner` | One IP targeting many distinct DIDs (called numbers) | 20 DIDs in 5m | high |
+
+The `server_rejected` detector pulls from two sources automatically:
+
+- **Log tailer**: matches OpenSIPS/Kamailio rejection lines (e.g. `Rejected inbound carrier INVITE from non-whitelisted source 1.2.3.4 for DID …`). The parsers cascade — kamailio + opensips are tried for every line regardless of the configured `format` — so a format mismatch no longer silently drops events.
+- **Pcap**: tracks request → final-response pairs by Call-ID. When the SIP server emits a 4xx, sipreaper synthesises an event attributed to the *original sender*, with `Rejected=true`. No log scraping required.
 
 ### Whitelist
 
@@ -192,11 +231,33 @@ bans:
 
 ```yaml
 enforcer:
-  type: "iptables"
+  type: "iptables"           # iptables | ipset
   chain: "SIPREAPER"
+  set_name: "sipreaper"      # only used when type=ipset
+
+  # Dry-run / shadow mode — record would-be bans, fire notifiers, increment
+  # metrics, but never touch the firewall. Use for a week to tune detector
+  # thresholds against your real traffic. Records show up in the store with
+  # status=dry_run.
+  dry_run: false
+
+  # Kernel-side per-IP INVITE rate limit. Drops volumetric INVITE floods at the
+  # firewall *before* userspace sees them. Defaults off.
+  prefilter:
+    enabled: false
+    rate: 5                  # INVITEs per second per source IP
+    burst: 10
+    ports: [5060, 5061]
 ```
 
-The iptables enforcer creates a dedicated chain (`SIPREAPER`) linked from `INPUT`. Bans add `DROP` rules; unbans remove them. On startup, active bans from SQLite are re-applied to the chain.
+**Two enforcer backends:**
+
+- **`iptables`** (default): one `-j DROP` rule per banned IP, in a dedicated `SIPREAPER` chain linked from `INPUT`. Simple, universal. Linear lookup per packet — fine up to a few thousand bans.
+- **`ipset`**: a single `hash:net` set; one match-rule jumps to it. Lookup is O(1) regardless of ban count. Recommended for any production deployment that's likely to accumulate >1k bans. Requires the `ipset` binary on the host.
+
+Either backend can be paired with the **prefilter** (an iptables `-m hashlimit` rule installed at chain init that drops INVITEs above `rate` per source IP). Userspace detection still runs on whatever traffic isn't dropped, so repeat offenders still earn a proper escalating ban.
+
+On startup, active bans from SQLite are re-applied. `dry_run` records are skipped.
 
 ### Notifications
 
@@ -228,6 +289,8 @@ api:
 
 The API only listens on localhost by default. Change the listen address if you need remote access (and ensure you're behind a firewall or VPN).
 
+Token compares are constant-time. `/healthz` and `/metrics` are intentionally **unauthenticated** so monitoring probes and Prometheus scrape jobs don't need to hold the bearer token; everything else requires `Authorization: Bearer <token>`.
+
 ### Storage
 
 ```yaml
@@ -235,7 +298,29 @@ storage:
   path: "/var/lib/sipreaper/sipreaper.db"
 ```
 
-SQLite database storing bans, event history, and dynamic whitelist entries.
+SQLite is opened with WAL journal mode, `busy_timeout=5000`, `synchronous=NORMAL`, and a single-writer connection cap. This eliminates `database is locked` under bursty traffic.
+
+Stored data: bans (incl. `dry_run` records), event history, dynamic whitelist entries.
+
+### Logging
+
+```yaml
+logging:
+  level: "info"              # trace | debug | info | warn | error
+  output: "stdout"           # stdout | stderr | console | file
+  file: "/var/log/sipreaper/sipreaper.log"   # only used when output=file
+```
+
+Output formats:
+
+- `stdout` / `stderr` / `file` — JSON, one event per line. The right shape for log shippers (Loki, Vector, Filebeat).
+- `console` — colourised pretty output. Good for `journalctl -u sipreaper -f` during dev / rollout.
+
+Existing `log.Printf` call sites are routed through zerolog so even older code paths emit timestamped, levelled output.
+
+### Config validation
+
+The daemon refuses to start if the config is obviously broken — empty ingest, zero windows, unknown enforcer type, missing `bans.durations`, etc. You'll see the error at startup, not silently in production.
 
 ## Usage
 
@@ -280,9 +365,14 @@ sipreaper whitelist
 # Add an IP to the dynamic whitelist
 sipreaper whitelist add 198.51.100.0/24 --comment "Partner SIP trunk"
 
+# Add an IP that's currently banned — clears the ban first
+sipreaper whitelist add 203.0.113.50 --clear-ban --comment "false positive"
+
 # Remove from whitelist
 sipreaper whitelist remove 198.51.100.0/24
 ```
+
+The daemon refuses (HTTP 409) to whitelist an IP that is currently banned unless `--clear-ban` is set. This avoids the silent foot-gun of whitelisting an IP whose firewall rule is still in place. Symmetrically, manual bans (`sipreaper ban …`) are refused with HTTP 409 if the IP is in the static or dynamic whitelist.
 
 ### Monitoring
 
@@ -290,7 +380,7 @@ sipreaper whitelist remove 198.51.100.0/24
 # Check daemon status
 sipreaper status
 
-# View detection statistics
+# View detection statistics (includes log_tailer matched/unmatched counts)
 sipreaper stats
 
 # Query recent events
@@ -301,7 +391,28 @@ sipreaper events --ip 203.0.113.100
 
 # Filter events by detector
 sipreaper events --detector brute_force
+
+# Inspect dry-run records (would-be bans during a tuning window)
+sipreaper bans --status dry_run
+
+# Unauthenticated probes for orchestration / monitoring
+curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/metrics
 ```
+
+### Diagnosing log lines
+
+`test-line` runs a single line through every parser and prints what was extracted, so you can confirm a particular log message will produce a ban-worthy event before deploying a config change:
+
+```bash
+# Single line
+sipreaper test-line "WARNING:Rejected inbound carrier INVITE from non-whitelisted source 77.68.33.97 for DID 64300441975359019"
+
+# Bulk: pipe a recent log file through and find lines no parser is matching
+tail -n 5000 /var/log/opensips.log | sipreaper test-line --stdin | grep "NO MATCH"
+```
+
+Successful matches print a JSON object (`parser`, `source_ip`, `method`, `rejected`, `to_user`, etc.). Unmatched lines print `NO MATCH: <line>`.
 
 ### Global Flags
 
@@ -317,19 +428,35 @@ sipreaper --api-token mysecret bans
 
 ## REST API
 
-All endpoints require `Authorization: Bearer <token>` header.
+All `/api/v1/*` endpoints require `Authorization: Bearer <token>`. `/healthz` and `/metrics` are unauthenticated.
 
-| Method | Path | Description |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/v1/status` | yes | Daemon health, uptime, active ban count |
+| `GET` | `/api/v1/bans` | yes | List bans. Query params: `status` (`active`/`expired`/`manual`/`dry_run`), `ip` |
+| `POST` | `/api/v1/bans` | yes | Manual ban. Body: `{"ip": "1.2.3.4", "duration": "1h"}`. Returns **409** if IP is whitelisted, **400** if invalid. |
+| `DELETE` | `/api/v1/bans/{ip}` | yes | Unban an IP |
+| `GET` | `/api/v1/whitelist` | yes | List whitelist entries |
+| `POST` | `/api/v1/whitelist` | yes | Add to whitelist. Body: `{"ip": "10.0.0.0/8", "comment": "...", "clear_ban": false}`. Returns **409** if IP is currently banned (unless `clear_ban: true`); accepts both single IPs and CIDRs. |
+| `DELETE` | `/api/v1/whitelist/{ip}` | yes | Remove from whitelist (and reload running engine) |
+| `GET` | `/api/v1/events` | yes | Query events. Params: `ip`, `detector`, `last` (duration) |
+| `GET` | `/api/v1/stats` | yes | Detection stats, bans by detector, top offenders, log-tailer matched/unmatched counts |
+| `GET` | `/healthz` | no | Subsystem health (store, log tailer, enforcer). 503 if any non-`ok`. |
+| `GET` | `/metrics` | no | Prometheus exposition format |
+
+### Prometheus metrics
+
+| Metric | Type | Labels |
 |---|---|---|
-| `GET` | `/api/v1/status` | Daemon health, uptime, active ban count |
-| `GET` | `/api/v1/bans` | List bans. Query params: `status` (active/expired/manual), `ip` |
-| `POST` | `/api/v1/bans` | Manual ban. Body: `{"ip": "1.2.3.4", "duration": "1h"}` |
-| `DELETE` | `/api/v1/bans/{ip}` | Unban an IP |
-| `GET` | `/api/v1/whitelist` | List whitelist entries |
-| `POST` | `/api/v1/whitelist` | Add to whitelist. Body: `{"ip": "10.0.0.0/8", "comment": "..."}` |
-| `DELETE` | `/api/v1/whitelist/{ip}` | Remove from whitelist |
-| `GET` | `/api/v1/events` | Query events. Params: `ip`, `detector`, `last` (duration) |
-| `GET` | `/api/v1/stats` | Detection stats, bans by detector, top offenders |
+| `sipreaper_events_total` | counter | `source` (log/pcap), `method` |
+| `sipreaper_threats_total` | counter | `detector`, `severity` |
+| `sipreaper_bans_total` | counter | `detector` |
+| `sipreaper_unbans_total` | counter | — |
+| `sipreaper_active_bans` | gauge | — |
+| `sipreaper_log_lines_matched_total` | counter | — |
+| `sipreaper_log_lines_unmatched_total` | counter | — |
+| `sipreaper_enforcer_errors_total` | counter | `op` (ban/unban) |
+| `sipreaper_detector_panics_total` | counter | `component` (detector name or `action_pipeline`) |
 
 ### Examples
 
@@ -340,18 +467,44 @@ curl -H "Authorization: Bearer $SIPREAPER_API_TOKEN" http://127.0.0.1:8080/api/v
 # List active bans
 curl -H "Authorization: Bearer $SIPREAPER_API_TOKEN" http://127.0.0.1:8080/api/v1/bans
 
+# List dry-run records (during a tuning window)
+curl -H "Authorization: Bearer $SIPREAPER_API_TOKEN" \
+  "http://127.0.0.1:8080/api/v1/bans?status=dry_run"
+
 # Manual ban
 curl -X POST -H "Authorization: Bearer $SIPREAPER_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"ip": "203.0.113.100", "duration": "2h"}' \
   http://127.0.0.1:8080/api/v1/bans
 
-# Add to whitelist
+# Add to whitelist (refused with 409 if 10.0.0.5 is currently banned)
 curl -X POST -H "Authorization: Bearer $SIPREAPER_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"ip": "10.0.0.0/8", "comment": "Internal"}' \
   http://127.0.0.1:8080/api/v1/whitelist
+
+# Whitelist a currently-banned IP, atomically clearing the ban
+curl -X POST -H "Authorization: Bearer $SIPREAPER_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"ip": "203.0.113.50", "comment": "false positive", "clear_ban": true}' \
+  http://127.0.0.1:8080/api/v1/whitelist
+
+# Health & metrics — no token required
+curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/metrics
 ```
+
+### Generating an API token
+
+There's no token generator — sipreaper compares the env var to the `Authorization: Bearer …` header. Any high-entropy random string works:
+
+```bash
+openssl rand -base64 32        # 256 bits, plenty
+# or
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Place it in `/etc/sipreaper/env` (mode 600) so systemd picks it up. Use a different token per host — a leaked token only compromises that host's bans/whitelist.
 
 ## Deployment
 
@@ -475,17 +628,36 @@ After starting the daemon:
 # Check the daemon is running
 sipreaper status
 
-# Check logs
+# Subsystem health (no token needed)
+curl -s http://127.0.0.1:8080/healthz | jq
+
+# Check logs (JSON if logging.output=stdout/file, pretty if console)
 sudo journalctl -u sipreaper -f
 
-# Verify the iptables chain was created
-sudo iptables -L SIPREAPER -n
+# Confirm log lines are being parsed (matched should climb when traffic flows)
+sipreaper stats | jq .log_tailer
+
+# Sanity-check the parsers against your real log format
+tail -n 200 /var/log/opensips.log | sipreaper test-line --stdin | grep "NO MATCH"
+
+# Verify the firewall chain / set was created
+sudo iptables -L SIPREAPER -n          # iptables enforcer
+sudo ipset list sipreaper              # ipset enforcer
 
 # Test a manual ban/unban
 sipreaper ban 192.0.2.1 5m
-sudo iptables -L SIPREAPER -n    # should show the DROP rule
+sudo iptables -L SIPREAPER -n          # should show the DROP rule (or ipset member)
 sipreaper unban 192.0.2.1
-sudo iptables -L SIPREAPER -n    # rule should be gone
+sudo iptables -L SIPREAPER -n          # rule should be gone
+
+# Tuning workflow with dry-run mode:
+#   1. set enforcer.dry_run: true in config
+#   2. restart daemon
+#   3. let it run for a representative window (a day, a week)
+#   4. inspect would-be bans:
+sipreaper bans --status dry_run
+#   5. tune detector thresholds in config based on what you see
+#   6. set dry_run: false and restart
 ```
 
 ### Firewall Considerations
@@ -502,16 +674,20 @@ If you're using `ufw` or `firewalld`, they should coexist fine since SIPReaper m
 ## Architecture
 
 ```
-Ingest (log + pcap)  ->  Dedup  ->  Detection (6 detectors)
-                                         |
-                                    Decision Engine
-                                    (whitelist + escalation)
-                                         |
-                                    Action Layer
-                                    (enforcer + notifiers)
+Ingest                                   Detection                Decision               Action
+──────                                   ─────────                ────────               ──────
+log tailer  ┐                                                                          ┌─ iptables / ipset
+            ├─→ Dedup ──→ Events ──→ 10 detectors ──→ Threats ──→ Engine ──→ Bans ─┼─ notifiers (syslog,email)
+pcap        ┘                              │                  (whitelist +          └─ store (SQLite)
+                                           │                   escalation)
+                                  panic recovery                    │
+                                                                  (dry-run skips enforcer)
 ```
 
-All components communicate through Go channels. Each detector runs as its own goroutine. SQLite provides persistence across restarts.
+- All components communicate through Go channels. Each detector runs in the detection goroutine; `safeDetect` wraps each call so a panic in one detector doesn't take the others down.
+- The pcap layer pairs requests with their final responses by `Call-ID` and synthesises `Rejected=true` events on 4xx/5xx, attributing them back to the original sender. The inflight Call-ID map is bounded (100k entries) with FIFO eviction to stay DoS-resistant.
+- SQLite provides persistence across restarts. `dry_run` records are persisted but never get re-applied to the firewall.
+- The pre-filter (when enabled) sits one layer below userspace: it's a kernel `hashlimit` rule that drops over-rate INVITEs at the firewall before they ever reach the detection pipeline.
 
 ## License
 

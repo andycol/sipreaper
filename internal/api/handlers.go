@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"time"
@@ -130,8 +131,9 @@ func (s *Server) handleListWhitelist(w http.ResponseWriter, r *http.Request) {
 }
 
 type addWhitelistRequest struct {
-	IP      string `json:"ip"`
-	Comment string `json:"comment"`
+	IP       string `json:"ip"`
+	Comment  string `json:"comment"`
+	ClearBan bool   `json:"clear_ban"`
 }
 
 func (s *Server) handleAddWhitelist(w http.ResponseWriter, r *http.Request) {
@@ -141,10 +143,52 @@ func (s *Server) handleAddWhitelist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate the IP/CIDR string. Whitelist accepts both — try IP first, fall
+	// back to CIDR. We don't normalise CIDRs here because the whitelist code
+	// already handles bare-IP "/32"/"/128" expansion.
+	if net.ParseIP(req.IP) == nil {
+		if _, _, err := net.ParseCIDR(req.IP); err != nil {
+			http.Error(w, "invalid ip or cidr", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// If the IP is currently banned, refuse — unless the caller explicitly
+	// asked to clear the ban first. This avoids the silent-foot-gun of
+	// whitelisting an IP without realising the existing ban will linger and
+	// keep the firewall rule in place.
+	if ip := net.ParseIP(req.IP); ip != nil {
+		existing, err := s.store.GetActiveBanByIP(ip.String())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if existing != nil {
+			if !req.ClearBan {
+				http.Error(w,
+					fmt.Sprintf("ip is currently banned (status=%s, detector=%s); pass clear_ban=true to atomically unban then whitelist",
+						existing.Status, existing.Detector),
+					http.StatusConflict)
+				return
+			}
+			if err := s.store.UpdateBanStatus(existing.ID, "expired"); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if s.unbanFn != nil && existing.Status != "dry_run" {
+				_ = s.unbanFn(ip)
+			}
+		}
+	}
+
 	id, err := s.store.AddWhitelist(req.IP, req.Comment, "dynamic")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	if s.reloadWhitelist != nil {
+		s.reloadWhitelist()
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{"id": id, "ip": req.IP})
@@ -156,6 +200,9 @@ func (s *Server) handleRemoveWhitelist(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.RemoveWhitelist(ip); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if s.reloadWhitelist != nil {
+		s.reloadWhitelist()
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed", "ip": ip})

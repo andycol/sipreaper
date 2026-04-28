@@ -13,14 +13,16 @@ import (
 )
 
 type Server struct {
-	store         *store.Store
-	token         string
-	listen        string
-	startTime     time.Time
-	httpSrv       *http.Server
-	logTailerStat func() (matched, unmatched uint64)
-	healthChecks  func() map[string]string
-	isWhitelisted func(net.IP) bool
+	store           *store.Store
+	token           string
+	listen          string
+	startTime       time.Time
+	httpSrv         *http.Server
+	logTailerStat   func() (matched, unmatched uint64)
+	healthChecks    func() map[string]string
+	isWhitelisted   func(net.IP) bool
+	unbanFn         func(net.IP) error
+	reloadWhitelist func()
 }
 
 func NewServer(s *store.Store, token, listen string) *Server {
@@ -89,6 +91,18 @@ func (s *Server) SetHealthChecks(fn func() map[string]string) {
 // requests can be refused if the operator tried to ban a whitelisted IP.
 func (s *Server) SetWhitelistGuard(fn func(net.IP) bool) {
 	s.isWhitelisted = fn
+}
+
+// SetUnbanFunc wires the firewall enforcer's Unban so the whitelist endpoint
+// can atomically clear an existing ban when ?clear_ban=true is set.
+func (s *Server) SetUnbanFunc(fn func(net.IP) error) {
+	s.unbanFn = fn
+}
+
+// SetReloadWhitelistFunc wires a callback that reloads the dynamic whitelist
+// into the running engine after it changes via the API.
+func (s *Server) SetReloadWhitelistFunc(fn func()) {
+	s.reloadWhitelist = fn
 }
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {

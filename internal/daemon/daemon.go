@@ -156,6 +156,14 @@ func Run(cfgPath string) error {
 		srv.SetLogTailerStats(func() (uint64, uint64) { return logTailer.Stats() })
 	}
 	srv.SetWhitelistGuard(wl.Contains)
+	srv.SetReloadWhitelistFunc(func() {
+		if err := wl.ReloadDynamic(); err != nil {
+			log.Printf("dynamic whitelist reload failed: %v", err)
+		}
+	})
+	if d.enforcer != nil {
+		srv.SetUnbanFunc(d.enforcer.Unban)
+	}
 	srv.SetHealthChecks(func() map[string]string {
 		out := map[string]string{}
 		if logTailer != nil {

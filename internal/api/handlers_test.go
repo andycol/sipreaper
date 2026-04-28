@@ -172,6 +172,74 @@ func TestManualUnban(t *testing.T) {
 	}
 }
 
+func TestAddWhitelistRefusesBannedIP(t *testing.T) {
+	srv, s := newTestServer(t)
+	s.CreateBan(models.BanEntry{
+		IP: "203.0.113.7", Detector: "brute_force", Reason: "test",
+		Severity: "high", BannedAt: time.Now(), Duration: 1 * time.Hour,
+		BanCount: 1, Status: "active",
+	})
+
+	body := `{"ip": "203.0.113.7", "comment": "oops"}`
+	req := httptest.NewRequest("POST", "/api/v1/whitelist", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status code = %d, want 409 for banned IP", w.Code)
+	}
+}
+
+func TestAddWhitelistWithClearBan(t *testing.T) {
+	srv, s := newTestServer(t)
+	s.CreateBan(models.BanEntry{
+		IP: "203.0.113.8", Detector: "brute_force", Reason: "test",
+		Severity: "high", BannedAt: time.Now(), Duration: 1 * time.Hour,
+		BanCount: 1, Status: "active",
+	})
+
+	var unbanned net.IP
+	srv.SetUnbanFunc(func(ip net.IP) error { unbanned = ip; return nil })
+
+	body := `{"ip": "203.0.113.8", "comment": "trusted partner", "clear_ban": true}`
+	req := httptest.NewRequest("POST", "/api/v1/whitelist", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status code = %d, want 201", w.Code)
+	}
+	if unbanned == nil || unbanned.String() != "203.0.113.8" {
+		t.Errorf("unban callback got %v, want 203.0.113.8", unbanned)
+	}
+	ban, _ := s.GetActiveBanByIP("203.0.113.8")
+	if ban != nil {
+		t.Error("ban should have been expired by clear_ban=true")
+	}
+}
+
+func TestAddWhitelistAcceptsCIDR(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	body := `{"ip": "10.0.0.0/8", "comment": "internal"}`
+	req := httptest.NewRequest("POST", "/api/v1/whitelist", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("status code = %d, want 201 (CIDR should be accepted)", w.Code)
+	}
+}
+
 func TestListWhitelist(t *testing.T) {
 	srv, s := newTestServer(t)
 
