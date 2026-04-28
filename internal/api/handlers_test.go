@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -109,6 +110,40 @@ func TestManualBan(t *testing.T) {
 	}
 	if ban.Status != "manual" {
 		t.Errorf("status = %q, want manual", ban.Status)
+	}
+}
+
+func TestManualBanRefusesWhitelistedIP(t *testing.T) {
+	srv, _ := newTestServer(t)
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/8")
+	srv.SetWhitelistGuard(func(ip net.IP) bool { return cidr.Contains(ip) })
+
+	body := `{"ip": "10.5.5.5", "duration": "1h"}`
+	req := httptest.NewRequest("POST", "/api/v1/bans", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status code = %d, want 409 for whitelisted IP", w.Code)
+	}
+}
+
+func TestManualBanRejectsInvalidIP(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	body := `{"ip": "not-an-ip", "duration": "1h"}`
+	req := httptest.NewRequest("POST", "/api/v1/bans", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status code = %d, want 400 for invalid IP", w.Code)
 	}
 }
 

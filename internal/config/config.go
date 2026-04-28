@@ -137,6 +137,10 @@ type EnforcerConfig struct {
 	Type    string `mapstructure:"type"`
 	Chain   string `mapstructure:"chain"`
 	SetName string `mapstructure:"set_name"`
+	// DryRun records what *would* be banned (in the store, in metrics, in
+	// notifications) but never touches the firewall. Use this to tune
+	// detector thresholds against real traffic for a week before going live.
+	DryRun bool `mapstructure:"dry_run"`
 	// PreFilter is the per-IP pre-filter rate limit applied at chain init for
 	// INVITE traffic. Optional — leave Rate=0 to disable.
 	PreFilter PreFilterConfig `mapstructure:"prefilter"`

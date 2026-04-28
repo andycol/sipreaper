@@ -73,6 +73,10 @@ func Run(cfgPath string) error {
 	d.setupEnforcer()
 	d.setupNotifiers()
 	d.engine = decision.New(s, wl, cfg.Bans.Durations, cfg.Bans.Cooldown)
+	d.engine.SetDryRun(cfg.Enforcer.DryRun)
+	if cfg.Enforcer.DryRun {
+		log.Println("DRY RUN MODE: no firewall changes will be applied; bans recorded with status=dry_run")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -151,6 +155,7 @@ func Run(cfgPath string) error {
 	if logTailer != nil {
 		srv.SetLogTailerStats(func() (uint64, uint64) { return logTailer.Stats() })
 	}
+	srv.SetWhitelistGuard(wl.Contains)
 	srv.SetHealthChecks(func() map[string]string {
 		out := map[string]string{}
 		if logTailer != nil {
@@ -352,16 +357,33 @@ func (d *Daemon) runDetectionPipeline(ctx context.Context, dedup *ingest.Dedup) 
 			metrics.EventsTotal.WithLabelValues(source, method).Inc()
 
 			for _, det := range d.detectors {
-				if threat := det.Detect(evt); threat != nil {
-					metrics.ThreatsTotal.WithLabelValues(threat.Detector, threat.Severity).Inc()
-					select {
-					case d.threats <- *threat:
-					default:
-						log.Println("threat channel full, dropping")
-					}
-				}
+				d.safeDetect(det, evt)
 			}
 		}
+	}
+}
+
+// safeDetect isolates a single detector invocation behind a panic boundary.
+// A panic in one detector (bad regex match, nil deref on a malformed event)
+// must not take the whole pipeline down — we log it and move on. Wrapped per
+// detector rather than per event so we know which detector misbehaved.
+func (d *Daemon) safeDetect(det detect.Detector, evt models.SIPEvent) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("detector %s panicked: %v", det.Name(), r)
+			metrics.DetectorPanicsTotal.WithLabelValues(det.Name()).Inc()
+		}
+	}()
+
+	threat := det.Detect(evt)
+	if threat == nil {
+		return
+	}
+	metrics.ThreatsTotal.WithLabelValues(threat.Detector, threat.Severity).Inc()
+	select {
+	case d.threats <- *threat:
+	default:
+		log.Println("threat channel full, dropping")
 	}
 }
 
@@ -371,39 +393,56 @@ func (d *Daemon) runActionPipeline(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case threat := <-d.threats:
-			banAction := d.engine.Evaluate(threat)
-			if banAction == nil {
-				continue
-			}
-
-			if d.enforcer != nil {
-				if err := d.enforcer.Ban(banAction.IP, banAction.Duration, banAction.Reason); err != nil {
-					metrics.EnforcerErrors.WithLabelValues("ban").Inc()
-					log.Printf("enforcer error: %v", err)
-				}
-			}
-			metrics.BansTotal.WithLabelValues(banAction.Detector).Inc()
-			metrics.ActiveBans.Inc()
-
-			notifyEvt := models.NotifyEvent{
-				Type:      "ban",
-				IP:        banAction.IP.String(),
-				Detector:  banAction.Detector,
-				Severity:  banAction.Severity,
-				Duration:  banAction.Duration,
-				Reason:    banAction.Reason,
-				Timestamp: time.Now(),
-			}
-			for _, n := range d.notifiers {
-				if err := n.Notify(notifyEvt); err != nil {
-					log.Printf("notifier %s error: %v", n.Name(), err)
-				}
-			}
-
-			log.Printf("BANNED %s (detector=%s, duration=%s, count=%d)",
-				banAction.IP, banAction.Detector, banAction.Duration, banAction.BanCount)
+			d.handleThreat(threat)
 		}
 	}
+}
+
+func (d *Daemon) handleThreat(threat models.Threat) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("action pipeline panicked handling %s threat: %v", threat.Detector, r)
+			metrics.DetectorPanicsTotal.WithLabelValues("action_pipeline").Inc()
+		}
+	}()
+
+	banAction := d.engine.Evaluate(threat)
+	if banAction == nil {
+		return
+	}
+
+	if d.enforcer != nil && !d.engine.DryRun() {
+		if err := d.enforcer.Ban(banAction.IP, banAction.Duration, banAction.Reason); err != nil {
+			metrics.EnforcerErrors.WithLabelValues("ban").Inc()
+			log.Printf("enforcer error: %v", err)
+		}
+	}
+	metrics.BansTotal.WithLabelValues(banAction.Detector).Inc()
+	if !d.engine.DryRun() {
+		metrics.ActiveBans.Inc()
+	}
+
+	notifyEvt := models.NotifyEvent{
+		Type:      "ban",
+		IP:        banAction.IP.String(),
+		Detector:  banAction.Detector,
+		Severity:  banAction.Severity,
+		Duration:  banAction.Duration,
+		Reason:    banAction.Reason,
+		Timestamp: time.Now(),
+	}
+	for _, n := range d.notifiers {
+		if err := n.Notify(notifyEvt); err != nil {
+			log.Printf("notifier %s error: %v", n.Name(), err)
+		}
+	}
+
+	prefix := "BANNED"
+	if d.engine.DryRun() {
+		prefix = "DRY RUN"
+	}
+	log.Printf("%s %s (detector=%s, duration=%s, count=%d)",
+		prefix, banAction.IP, banAction.Detector, banAction.Duration, banAction.BanCount)
 }
 
 func (d *Daemon) runBanExpiry(ctx context.Context, interval time.Duration) {
@@ -425,13 +464,17 @@ func (d *Daemon) runBanExpiry(ctx context.Context, interval time.Duration) {
 			}
 			for _, ban := range expired {
 				d.store.UpdateBanStatus(ban.ID, "expired")
-				if d.enforcer != nil {
+				// Dry-run entries never had a firewall rule installed, so
+				// skip the enforcer call (would error on non-existent rule).
+				if d.enforcer != nil && ban.Status != "dry_run" {
 					if err := d.enforcer.Unban(net.ParseIP(ban.IP)); err != nil {
 						metrics.EnforcerErrors.WithLabelValues("unban").Inc()
 					}
 				}
 				metrics.UnbansTotal.Inc()
-				metrics.ActiveBans.Dec()
+				if ban.Status != "dry_run" {
+					metrics.ActiveBans.Dec()
+				}
 
 				for _, n := range d.notifiers {
 					n.Notify(models.NotifyEvent{

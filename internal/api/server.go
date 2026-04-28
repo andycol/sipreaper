@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +20,7 @@ type Server struct {
 	httpSrv       *http.Server
 	logTailerStat func() (matched, unmatched uint64)
 	healthChecks  func() map[string]string
+	isWhitelisted func(net.IP) bool
 }
 
 func NewServer(s *store.Store, token, listen string) *Server {
@@ -82,6 +85,12 @@ func (s *Server) SetHealthChecks(fn func() map[string]string) {
 	s.healthChecks = fn
 }
 
+// SetWhitelistGuard wires a whitelist-membership function so manual ban
+// requests can be refused if the operator tried to ban a whitelisted IP.
+func (s *Server) SetWhitelistGuard(fn func(net.IP) bool) {
+	s.isWhitelisted = fn
+}
+
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.token == "" {
@@ -90,7 +99,17 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || auth[7:] != s.token {
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// Constant-time compare. Equal-length is required for ConstantTimeCompare
+		// to actually do constant-time work — otherwise it short-circuits on the
+		// length check.
+		got := []byte(auth[7:])
+		want := []byte(s.token)
+		if subtle.ConstantTimeEq(int32(len(got)), int32(len(want))) != 1 ||
+			subtle.ConstantTimeCompare(got, want) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

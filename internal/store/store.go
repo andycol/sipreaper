@@ -125,9 +125,11 @@ func (s *Store) ListBans(status string) ([]models.BanEntry, error) {
 }
 
 func (s *Store) GetActiveBanByIP(ip string) (*models.BanEntry, error) {
+	// dry_run is included so the decision engine doesn't fire repeatedly for
+	// the same IP during a tuning run.
 	row := s.db.QueryRow(
 		`SELECT id, ip, detector, reason, severity, banned_at, duration, expires_at, ban_count, status
-		 FROM bans WHERE ip = ? AND status IN ('active', 'manual') LIMIT 1`, ip,
+		 FROM bans WHERE ip = ? AND status IN ('active', 'manual', 'dry_run') LIMIT 1`, ip,
 	)
 
 	var e models.BanEntry
@@ -164,9 +166,11 @@ func (s *Store) BanCountByIP(ip string, since time.Time) (int, error) {
 }
 
 func (s *Store) GetExpiredBans() ([]models.BanEntry, error) {
+	// dry_run entries expire too — otherwise an IP only ever produces one
+	// would-be-ban record, masking the true rate during a tuning window.
 	rows, err := s.db.Query(
 		`SELECT id, ip, detector, reason, severity, banned_at, duration, expires_at, ban_count, status
-		 FROM bans WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?`,
+		 FROM bans WHERE status IN ('active','dry_run') AND expires_at IS NOT NULL AND expires_at <= ?`,
 		time.Now(),
 	)
 	if err != nil {

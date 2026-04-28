@@ -89,6 +89,10 @@ enforcer:
   type: "iptables"           # iptables | ipset
   chain: "SIPREAPER"
   set_name: "sipreaper"      # only used when type=ipset
+  # When true, sipreaper records would-be bans (status=dry_run) and emits
+  # notifications + metrics, but never touches the firewall. Use this for a
+  # week to tune detector thresholds against your real traffic, then flip off.
+  dry_run: false
   # Kernel-side per-IP INVITE rate limit. Drops volumetric INVITE floods at the
   # firewall *before* userspace sees them — protects the SIP server from being
   # knocked over while sipreaper is detecting.

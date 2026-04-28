@@ -14,6 +14,7 @@ type Engine struct {
 	whitelist *whitelist.Whitelist
 	durations []time.Duration
 	cooldown  time.Duration
+	dryRun    bool
 }
 
 func New(s *store.Store, wl *whitelist.Whitelist, durations []time.Duration, cooldown time.Duration) *Engine {
@@ -24,6 +25,15 @@ func New(s *store.Store, wl *whitelist.Whitelist, durations []time.Duration, coo
 		cooldown:  cooldown,
 	}
 }
+
+// SetDryRun toggles shadow mode. When true, evaluations still record into the
+// store with status="dry_run" so they can be queried for tuning, but the
+// daemon will not invoke the enforcer. Existing dry_run records are not
+// re-applied on restart.
+func (e *Engine) SetDryRun(b bool) { e.dryRun = b }
+
+// DryRun reports whether the engine is in shadow mode.
+func (e *Engine) DryRun() bool { return e.dryRun }
 
 func (e *Engine) Evaluate(threat models.Threat) *models.BanAction {
 	ip := threat.SourceIP
@@ -64,6 +74,11 @@ func (e *Engine) Evaluate(threat models.Threat) *models.BanAction {
 		expiresAt = &t
 	}
 
+	status := "active"
+	if e.dryRun {
+		status = "dry_run"
+	}
+
 	_, err = e.store.CreateBan(models.BanEntry{
 		IP:        ipStr,
 		Detector:  threat.Detector,
@@ -73,7 +88,7 @@ func (e *Engine) Evaluate(threat models.Threat) *models.BanAction {
 		Duration:  duration,
 		ExpiresAt: expiresAt,
 		BanCount:  banCount,
-		Status:    "active",
+		Status:    status,
 	})
 	if err != nil {
 		log.Printf("decision: error creating ban for %s: %v", ipStr, err)

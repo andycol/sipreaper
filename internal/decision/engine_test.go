@@ -93,6 +93,33 @@ func TestDecisionAlreadyBannedSkips(t *testing.T) {
 	}
 }
 
+func TestDecisionDryRunRecordsButFlagsStatus(t *testing.T) {
+	eng, s := newTestEngine(t)
+	eng.SetDryRun(true)
+
+	threat := models.Threat{
+		Timestamp: time.Now(), SourceIP: net.ParseIP("10.0.0.7"),
+		Detector: "brute_force", Severity: "high",
+		Description: "test", EventCount: 5,
+	}
+
+	action := eng.Evaluate(threat)
+	if action == nil {
+		t.Fatal("dry-run should still emit a BanAction so notifiers + metrics fire")
+	}
+
+	stored, err := s.GetActiveBanByIP("10.0.0.7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil {
+		t.Fatal("expected dry-run record to be persisted")
+	}
+	if stored.Status != "dry_run" {
+		t.Errorf("status = %q, want dry_run", stored.Status)
+	}
+}
+
 func TestDecisionEscalatingDurations(t *testing.T) {
 	eng, s := newTestEngine(t)
 

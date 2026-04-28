@@ -48,4 +48,9 @@ var (
 		Name: "sipreaper_enforcer_errors_total",
 		Help: "Enforcer ban/unban errors, labelled by op.",
 	}, []string{"op"})
+
+	DetectorPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sipreaper_detector_panics_total",
+		Help: "Recovered panics in detector or action pipeline, labelled by component.",
+	}, []string{"component"})
 )

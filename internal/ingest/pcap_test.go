@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -65,6 +66,38 @@ func TestPcapResponsePairingAttributesRejectionToOriginalSender(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for synthesized response event")
+	}
+}
+
+func TestPcapInflightMapIsBounded(t *testing.T) {
+	// Drain channel keeps the goroutine that emits events from blocking.
+	events := make(chan models.SIPEvent, 1024)
+	go func() {
+		for range events {
+		}
+	}()
+
+	pc := &PcapCapture{events: events, done: make(chan struct{}), inflight: make(map[string]requestRecord)}
+
+	src := net.ParseIP("203.0.113.1")
+	dst := net.ParseIP("10.0.0.1")
+
+	// Push a couple thousand more requests than the cap; each with a unique
+	// Call-ID so nothing collapses.
+	overflow := 200
+	for i := 0; i < inflightMaxEntries+overflow; i++ {
+		pc.handleSIP(src, dst, &SIPMessage{
+			Method: "INVITE",
+			CallID: fmt.Sprintf("call-%d", i),
+		})
+	}
+
+	pc.inflightMu.Lock()
+	got := len(pc.inflight)
+	pc.inflightMu.Unlock()
+
+	if got > inflightMaxEntries {
+		t.Errorf("inflight grew to %d, cap is %d", got, inflightMaxEntries)
 	}
 }
 

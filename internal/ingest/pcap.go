@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,12 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 )
+
+// inflightMaxEntries caps the Call-ID → request map. A scanner that uses a
+// fresh Call-ID per probe could otherwise grow this without bound until the
+// 5-minute prune runs. ~200 bytes/entry × 100k = ~20MB worst case before
+// overflow eviction kicks in.
+const inflightMaxEntries = 100_000
 
 type PcapCapture struct {
 	iface  string
@@ -48,6 +55,30 @@ func NewPcapCapture(iface string, ports []int, customFilter string, events chan<
 	}
 	go pc.pruneInflight()
 	return pc
+}
+
+// evictOldestInflightLocked removes up to n oldest entries. Must be called
+// with inflightMu held. We don't keep an LRU list; under overflow we sort
+// once and drop the oldest n. O(map log map) but only runs at overflow.
+func (pc *PcapCapture) evictOldestInflightLocked(n int) {
+	if n <= 0 || len(pc.inflight) == 0 {
+		return
+	}
+	type aged struct {
+		k string
+		t time.Time
+	}
+	all := make([]aged, 0, len(pc.inflight))
+	for k, v := range pc.inflight {
+		all = append(all, aged{k, v.seen})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].t.Before(all[j].t) })
+	if n > len(all) {
+		n = len(all)
+	}
+	for i := 0; i < n; i++ {
+		delete(pc.inflight, all[i].k)
+	}
 }
 
 // pruneInflight expires Call-ID records we never matched a response to. SIP
@@ -137,6 +168,9 @@ func (pc *PcapCapture) handleSIP(srcIP, dstIP net.IP, msg *SIPMessage) {
 	if !msg.IsResponse {
 		if msg.CallID != "" {
 			pc.inflightMu.Lock()
+			if len(pc.inflight) >= inflightMaxEntries {
+				pc.evictOldestInflightLocked(inflightMaxEntries / 10)
+			}
 			pc.inflight[msg.CallID] = requestRecord{
 				srcIP: srcIP, method: msg.Method, userAgent: msg.UserAgent,
 				fromUser: msg.FromUser, toUser: msg.ToUser, seen: time.Now(),

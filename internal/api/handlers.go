@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"time"
 
@@ -46,6 +47,17 @@ func (s *Server) handleCreateBan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := net.ParseIP(req.IP)
+	if ip == nil {
+		http.Error(w, "invalid ip", http.StatusBadRequest)
+		return
+	}
+
+	if s.isWhitelisted != nil && s.isWhitelisted(ip) {
+		http.Error(w, "ip is whitelisted; remove from whitelist before banning", http.StatusConflict)
+		return
+	}
+
 	var dur time.Duration
 	if req.Duration != "" {
 		var err error
@@ -63,7 +75,7 @@ func (s *Server) handleCreateBan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry := models.BanEntry{
-		IP:        req.IP,
+		IP:        ip.String(),
 		Detector:  "manual",
 		Reason:    "manual ban via API",
 		Severity:  "medium",
