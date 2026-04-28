@@ -44,6 +44,29 @@ detectors:
     enabled: true
     max_extensions: 10
     window: 60s
+  # Triggers when the SIP server itself has rejected a request (e.g. carrier
+  # source not whitelisted, denied/forbidden). High-confidence signal — defaults
+  # to a single rejection inside the window.
+  server_rejected:
+    enabled: true
+    max_hits: 1
+    window: 5m
+  # Decoy extensions / DIDs no real user dials. First request to any of these
+  # bans the source forever (well — for the configured permaban duration).
+  honeypot:
+    enabled: false
+    extensions: ["1000", "0000", "admin", "test"]
+  # Toll-fraud reconnaissance: high failure rate on outbound INVITEs from one IP.
+  failed_call_ratio:
+    enabled: false
+    min_calls: 20
+    min_ratio: 0.8
+    window: 5m
+  # One IP reaching for many distinct DIDs in a short window — dial-plan probing.
+  did_scanner:
+    enabled: false
+    max_dids: 20
+    window: 5m
 
 # Whitelist
 whitelist:
@@ -63,8 +86,17 @@ bans:
 
 # Enforcement
 enforcer:
-  type: "iptables"
+  type: "iptables"           # iptables | ipset
   chain: "SIPREAPER"
+  set_name: "sipreaper"      # only used when type=ipset
+  # Kernel-side per-IP INVITE rate limit. Drops volumetric INVITE floods at the
+  # firewall *before* userspace sees them — protects the SIP server from being
+  # knocked over while sipreaper is detecting.
+  prefilter:
+    enabled: false
+    rate: 5                  # INVITEs / sec / source IP
+    burst: 10
+    ports: [5060, 5061]
 
 # Notifications
 notifiers:

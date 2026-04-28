@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -10,12 +11,16 @@ import (
 	"syscall"
 	"time"
 
+	"net/http"
+
 	"github.com/andycol/sipreaper/internal/action"
 	"github.com/andycol/sipreaper/internal/api"
 	"github.com/andycol/sipreaper/internal/config"
 	"github.com/andycol/sipreaper/internal/decision"
 	"github.com/andycol/sipreaper/internal/detect"
 	"github.com/andycol/sipreaper/internal/ingest"
+	"github.com/andycol/sipreaper/internal/logging"
+	"github.com/andycol/sipreaper/internal/metrics"
 	"github.com/andycol/sipreaper/internal/models"
 	"github.com/andycol/sipreaper/internal/store"
 	"github.com/andycol/sipreaper/internal/whitelist"
@@ -31,12 +36,17 @@ type Daemon struct {
 	detectors []detect.Detector
 	events    chan models.SIPEvent
 	threats   chan models.Threat
+	startTime time.Time
 }
 
 func Run(cfgPath string) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
+	}
+
+	if err := logging.Init(cfg.Logging.Level, cfg.Logging.Output, cfg.Logging.File); err != nil {
+		return fmt.Errorf("init logging: %w", err)
 	}
 
 	s, err := store.New(cfg.Storage.Path)
@@ -56,6 +66,7 @@ func Run(cfgPath string) error {
 		whitelist: wl,
 		events:    make(chan models.SIPEvent, 1000),
 		threats:   make(chan models.Threat, 100),
+		startTime: time.Now(),
 	}
 
 	d.setupDetectors()
@@ -72,8 +83,11 @@ func Run(cfgPath string) error {
 	var wg sync.WaitGroup
 
 	// Start ingesters
+	var logTailer *ingest.LogTailer
 	if cfg.Ingest.Log.Enabled {
-		tailer, err := ingest.NewLogTailer(
+		log.Printf("starting log tailer: path=%s format=%s", cfg.Ingest.Log.Path, cfg.Ingest.Log.Format)
+		var err error
+		logTailer, err = ingest.NewLogTailer(
 			cfg.Ingest.Log.Path, cfg.Ingest.Log.Format,
 			cfg.Ingest.Log.CustomPatterns, d.events,
 		)
@@ -81,29 +95,32 @@ func Run(cfgPath string) error {
 			log.Printf("warning: log tailer init failed: %v", err)
 		} else {
 			wg.Add(1)
-			go func() { defer wg.Done(); tailer.Run() }()
-			defer tailer.Stop()
+			go func() { defer wg.Done(); logTailer.Run() }()
 		}
+	} else {
+		log.Println("log tailer: disabled")
 	}
 
+	var pcapCapture *ingest.PcapCapture
 	if cfg.Ingest.Pcap.Enabled {
-		pcap := ingest.NewPcapCapture(
+		log.Printf("starting pcap capture: interface=%s ports=%v", cfg.Ingest.Pcap.Interface, cfg.Ingest.Pcap.Ports)
+		pcapCapture = ingest.NewPcapCapture(
 			cfg.Ingest.Pcap.Interface, cfg.Ingest.Pcap.Ports,
 			cfg.Ingest.Pcap.BPFFilter, d.events,
 		)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := pcap.Run(); err != nil {
+			if err := pcapCapture.Run(); err != nil {
 				log.Printf("pcap error: %v", err)
 			}
 		}()
-		defer pcap.Stop()
+	} else {
+		log.Println("pcap capture: disabled")
 	}
 
 	// Start dedup + detection pipeline
 	dedup := ingest.NewDedup(5 * time.Second)
-	defer dedup.Stop()
 
 	wg.Add(1)
 	go func() {
@@ -131,11 +148,53 @@ func Run(cfgPath string) error {
 	// Start API server
 	token := os.Getenv(cfg.API.TokenEnv)
 	srv := api.NewServer(s, token, cfg.API.Listen)
+	if logTailer != nil {
+		srv.SetLogTailerStats(func() (uint64, uint64) { return logTailer.Stats() })
+	}
+	srv.SetHealthChecks(func() map[string]string {
+		out := map[string]string{}
+		if logTailer != nil {
+			matched, _ := logTailer.Stats()
+			if matched == 0 && time.Since(d.startTime) > 5*time.Minute {
+				// 5 minutes with not a single matched line is suspicious — either
+				// the file has rotated, the format changed, or we're reading the
+				// wrong path. Either way an operator should investigate.
+				out["log_tailer"] = "no matches in last 5m"
+			} else {
+				out["log_tailer"] = "ok"
+			}
+		}
+		if d.enforcer != nil {
+			out["enforcer"] = "ok"
+		}
+		return out
+	})
+
+	// Periodic parser-stats heartbeat — useful for spotting sudden drops in
+	// matched lines (e.g. log format changed under us) and for confirming the
+	// tailer is actually receiving data.
+	if logTailer != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					m, u := logTailer.Stats()
+					log.Printf("log tailer stats: matched=%d unmatched=%d", m, u)
+				}
+			}
+		}()
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		log.Printf("API listening on %s", cfg.API.Listen)
-		if err := srv.ListenAndServe(); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("API server error: %v", err)
 		}
 	}()
@@ -156,9 +215,23 @@ func Run(cfgPath string) error {
 			continue
 		}
 		log.Printf("received %s, shutting down...", sig)
-		cancel()
 		break
 	}
+
+	// Stop everything before waiting on goroutines
+	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	srv.Shutdown(shutdownCtx)
+
+	if logTailer != nil {
+		logTailer.Stop()
+	}
+	if pcapCapture != nil {
+		pcapCapture.Stop()
+	}
+	dedup.Stop()
 
 	wg.Wait()
 	log.Println("sipreaper daemon stopped")
@@ -191,21 +264,56 @@ func (d *Daemon) setupDetectors() {
 	if cfg.UserEnum.Enabled {
 		d.detectors = append(d.detectors, detect.NewUserEnum(cfg.UserEnum.MaxExtensions, cfg.UserEnum.Window))
 	}
+	if cfg.ServerRejected.Enabled {
+		d.detectors = append(d.detectors, detect.NewServerRejected(cfg.ServerRejected.MaxHits, cfg.ServerRejected.Window))
+	}
+	if cfg.Honeypot.Enabled {
+		d.detectors = append(d.detectors, detect.NewHoneypot(cfg.Honeypot.Extensions))
+	}
+	if cfg.FailedCallRatio.Enabled {
+		d.detectors = append(d.detectors, detect.NewFailedCallRatio(
+			cfg.FailedCallRatio.MinCalls, cfg.FailedCallRatio.MinRatio, cfg.FailedCallRatio.Window,
+		))
+	}
+	if cfg.DIDScanner.Enabled {
+		d.detectors = append(d.detectors, detect.NewDIDScanner(cfg.DIDScanner.MaxDIDs, cfg.DIDScanner.Window))
+	}
 
 	log.Printf("loaded %d detectors", len(d.detectors))
 }
 
 func (d *Daemon) setupEnforcer() {
 	switch d.cfg.Enforcer.Type {
-	case "iptables":
+	case "ipset":
+		e := action.NewIPSetEnforcer(d.cfg.Enforcer.SetName, d.cfg.Enforcer.Chain)
+		if err := e.Init(); err != nil {
+			log.Printf("warning: ipset init failed: %v", err)
+		}
+		d.enforcer = e
+	case "iptables", "":
 		e := action.NewIPTablesEnforcer(d.cfg.Enforcer.Chain)
 		if err := e.Init(); err != nil {
 			log.Printf("warning: iptables init failed: %v", err)
 		}
 		d.enforcer = e
 	default:
-		log.Printf("warning: unknown enforcer type %q, using iptables", d.cfg.Enforcer.Type)
+		log.Printf("warning: unknown enforcer type %q, falling back to iptables", d.cfg.Enforcer.Type)
 		d.enforcer = action.NewIPTablesEnforcer(d.cfg.Enforcer.Chain)
+	}
+
+	if d.cfg.Enforcer.PreFilter.Enabled {
+		pf := action.NewPreFilter(
+			d.cfg.Enforcer.Chain,
+			d.cfg.Enforcer.PreFilter.Rate,
+			d.cfg.Enforcer.PreFilter.Burst,
+			d.cfg.Enforcer.PreFilter.Ports,
+		)
+		if err := pf.Apply(); err != nil {
+			log.Printf("warning: prefilter setup failed: %v", err)
+		} else {
+			log.Printf("prefilter active: %d INVITEs/sec/IP burst=%d ports=%v",
+				d.cfg.Enforcer.PreFilter.Rate, d.cfg.Enforcer.PreFilter.Burst, d.cfg.Enforcer.PreFilter.Ports)
+		}
 	}
 }
 
@@ -229,12 +337,23 @@ func (d *Daemon) runDetectionPipeline(ctx context.Context, dedup *ingest.Dedup) 
 		case <-ctx.Done():
 			return
 		case evt := <-d.events:
-			if evt.CallID != "" && dedup.IsDuplicate(evt.CallID, evt.Method) {
+			if evt.CallID != "" && dedup.IsDuplicateEvent(evt.CallID, evt.Method, evt.ResponseCode) {
 				continue
 			}
 
+			source := evt.Source
+			if source == "" {
+				source = "unknown"
+			}
+			method := evt.Method
+			if method == "" {
+				method = "UNKNOWN"
+			}
+			metrics.EventsTotal.WithLabelValues(source, method).Inc()
+
 			for _, det := range d.detectors {
 				if threat := det.Detect(evt); threat != nil {
+					metrics.ThreatsTotal.WithLabelValues(threat.Detector, threat.Severity).Inc()
 					select {
 					case d.threats <- *threat:
 					default:
@@ -259,9 +378,12 @@ func (d *Daemon) runActionPipeline(ctx context.Context) {
 
 			if d.enforcer != nil {
 				if err := d.enforcer.Ban(banAction.IP, banAction.Duration, banAction.Reason); err != nil {
+					metrics.EnforcerErrors.WithLabelValues("ban").Inc()
 					log.Printf("enforcer error: %v", err)
 				}
 			}
+			metrics.BansTotal.WithLabelValues(banAction.Detector).Inc()
+			metrics.ActiveBans.Inc()
 
 			notifyEvt := models.NotifyEvent{
 				Type:      "ban",
@@ -304,8 +426,12 @@ func (d *Daemon) runBanExpiry(ctx context.Context, interval time.Duration) {
 			for _, ban := range expired {
 				d.store.UpdateBanStatus(ban.ID, "expired")
 				if d.enforcer != nil {
-					d.enforcer.Unban(net.ParseIP(ban.IP))
+					if err := d.enforcer.Unban(net.ParseIP(ban.IP)); err != nil {
+						metrics.EnforcerErrors.WithLabelValues("unban").Inc()
+					}
 				}
+				metrics.UnbansTotal.Inc()
+				metrics.ActiveBans.Dec()
 
 				for _, n := range d.notifiers {
 					n.Notify(models.NotifyEvent{

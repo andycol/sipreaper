@@ -16,6 +16,11 @@ type SIPEvent struct {
 	CallID       string
 	ResponseCode int    // 0 if this is a request
 	Source       string // "log" or "pcap"
+	// Rejected is true when the SIP server itself explicitly rejected this
+	// request (e.g. "non-whitelisted source", "denied", "forbidden"). This is
+	// a much higher-confidence signal than a raw request count.
+	Rejected     bool
+	RejectReason string
 }
 
 // Threat is emitted by a detector when a threshold is breached.

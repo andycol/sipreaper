@@ -108,7 +108,14 @@ logging:
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
-	yaml := `{}`
+	// Minimum viable config: at least one ingest source must be enabled, since
+	// validation rejects the alternative.
+	yaml := `
+ingest:
+  log:
+    enabled: true
+    path: "/var/log/kamailio/kamailio.log"
+`
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
@@ -131,5 +138,47 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.Storage.Path != "/var/lib/sipreaper/sipreaper.db" {
 		t.Errorf("default storage path = %q, want /var/lib/sipreaper/sipreaper.db", cfg.Storage.Path)
+	}
+}
+
+func TestValidateRejectsBadConfigs(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(c *Config)
+	}{
+		{"no ingest", func(c *Config) { c.Ingest.Log.Enabled = false; c.Ingest.Pcap.Enabled = false }},
+		{"log enabled no path", func(c *Config) { c.Ingest.Log.Path = "" }},
+		{"unknown enforcer", func(c *Config) { c.Enforcer.Type = "wishful-thinking" }},
+		{"empty bans durations", func(c *Config) { c.Bans.Durations = nil }},
+		{"negative ban duration", func(c *Config) { c.Bans.Durations = []time.Duration{-1 * time.Minute} }},
+		{"empty api listen", func(c *Config) { c.API.Listen = "" }},
+		{"bad detector window", func(c *Config) {
+			c.Detectors.BruteForce.Enabled = true
+			c.Detectors.BruteForce.MaxAttempts = 5
+			c.Detectors.BruteForce.Window = 0
+		}},
+		{"bad log format", func(c *Config) { c.Ingest.Log.Format = "junos" }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validBaseConfig()
+			tc.mut(c)
+			if err := c.Validate(); err == nil {
+				t.Fatal("expected Validate to reject this config")
+			}
+		})
+	}
+}
+
+func validBaseConfig() *Config {
+	return &Config{
+		Ingest: IngestConfig{
+			Log: LogIngestConfig{Enabled: true, Path: "/var/log/test.log", Format: "kamailio"},
+		},
+		Bans: BansConfig{Durations: []time.Duration{5 * time.Minute}, Cooldown: time.Hour, CheckInterval: 30 * time.Second},
+		Enforcer: EnforcerConfig{Type: "iptables", Chain: "SIPREAPER"},
+		API:     APIConfig{Listen: "127.0.0.1:8080"},
+		Storage: StorageConfig{Path: "/tmp/test.db"},
 	}
 }

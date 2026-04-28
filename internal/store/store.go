@@ -15,10 +15,19 @@ type Store struct {
 }
 
 func New(path string) (*Store, error) {
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL")
+	// WAL gives us concurrent readers + a single writer, busy_timeout retries
+	// briefly when another goroutine holds the lock instead of failing fast,
+	// foreign_keys + synchronous=NORMAL is the documented "safe & fast" combo
+	// for WAL.
+	dsn := path + "?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_foreign_keys=on"
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
+
+	// SQLite is single-writer; cap connections so we serialise writes inside
+	// the driver instead of getting SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
 
 	if err := migrate(db); err != nil {
 		db.Close()
@@ -26,6 +35,11 @@ func New(path string) (*Store, error) {
 	}
 
 	return &Store{db: db}, nil
+}
+
+// HealthCheck verifies the DB is reachable and writable.
+func (s *Store) HealthCheck() error {
+	return s.db.Ping()
 }
 
 func (s *Store) Close() error {

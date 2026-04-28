@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"strconv"
 	"sync"
 	"time"
 )
@@ -23,7 +24,17 @@ func NewDedup(window time.Duration) *Dedup {
 }
 
 func (d *Dedup) IsDuplicate(callID, method string) bool {
-	key := callID + "|" + method
+	return d.isDup(callID + "|" + method)
+}
+
+// IsDuplicateEvent considers Call-ID + Method + ResponseCode so that the
+// request "INVITE" and the synthesized "INVITE/403" derived from a response
+// are not collapsed into one.
+func (d *Dedup) IsDuplicateEvent(callID, method string, responseCode int) bool {
+	return d.isDup(callID + "|" + method + "|" + strconv.Itoa(responseCode))
+}
+
+func (d *Dedup) isDup(key string) bool {
 	now := time.Now()
 
 	d.mu.Lock()

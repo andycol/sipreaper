@@ -182,12 +182,55 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		ipCounts[b.IP]++
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"total_bans":       len(bans),
 		"active_bans":      len(activeBans),
 		"bans_by_detector": detectorCounts,
 		"bans_by_ip":       ipCounts,
-	})
+	}
+
+	if s.logTailerStat != nil {
+		matched, unmatched := s.logTailerStat()
+		resp["log_tailer"] = map[string]uint64{
+			"matched":   matched,
+			"unmatched": unmatched,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	checks := map[string]string{}
+	if err := s.store.HealthCheck(); err != nil {
+		checks["store"] = "error: " + err.Error()
+	} else {
+		checks["store"] = "ok"
+	}
+
+	if s.healthChecks != nil {
+		for k, v := range s.healthChecks() {
+			checks[k] = v
+		}
+	}
+
+	overall := http.StatusOK
+	for _, v := range checks {
+		if v != "ok" {
+			overall = http.StatusServiceUnavailable
+			break
+		}
+	}
+
+	resp := map[string]interface{}{
+		"status": "ok",
+		"checks": checks,
+		"uptime": time.Since(s.startTime).String(),
+	}
+	if overall != http.StatusOK {
+		resp["status"] = "degraded"
+	}
+	writeJSON(w, overall, resp)
 }
 
 func writeJSON(w http.ResponseWriter, code int, data interface{}) {

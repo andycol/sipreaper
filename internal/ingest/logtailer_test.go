@@ -60,6 +60,53 @@ func TestParseKamailioUnmatchedLine(t *testing.T) {
 	}
 }
 
+func TestParseOpenSIPSCarrierRejectionWithDID(t *testing.T) {
+	line := `Apr 28 11:02:14 sip2 opensips[4321]: WARNING:Rejected inbound carrier INVITE from non-whitelisted source 77.68.33.97 for DID 64300441975359019`
+
+	evt, err := parseOpenSIPSLine(line)
+	if err != nil {
+		t.Fatalf("parseOpenSIPSLine() error: %v", err)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil event for carrier rejection log line")
+	}
+	if got := evt.SourceIP.String(); got != "77.68.33.97" {
+		t.Errorf("source ip = %q, want 77.68.33.97", got)
+	}
+	if evt.Method != "INVITE" {
+		t.Errorf("method = %q, want INVITE", evt.Method)
+	}
+	if !evt.Rejected {
+		t.Error("expected Rejected=true")
+	}
+	if evt.RejectReason == "" {
+		t.Error("expected non-empty RejectReason")
+	}
+	if evt.ToUser != "64300441975359019" {
+		t.Errorf("ToUser (DID) = %q, want 64300441975359019", evt.ToUser)
+	}
+	if evt.ResponseCode != 403 {
+		t.Errorf("response code = %d, want 403", evt.ResponseCode)
+	}
+}
+
+func TestLogTailerCascadesParsersWhenFormatIsKamailio(t *testing.T) {
+	// User has format=kamailio configured but the underlying SIP server is
+	// emitting opensips-style rejection lines. The tailer must still recognise
+	// them — silently dropping was the bug that let 77.68.33.97 through.
+	events := make(chan models.SIPEvent, 1)
+	lt := &LogTailer{format: "kamailio", events: events, done: make(chan struct{})}
+
+	line := `Apr 28 11:02:14 sip2 opensips[4321]: WARNING:Rejected inbound carrier INVITE from non-whitelisted source 77.68.33.97 for DID 64300441975359019`
+	evt := lt.parseLine(line)
+	if evt == nil {
+		t.Fatal("expected the cascade to fall through to opensips parser")
+	}
+	if evt.SourceIP.String() != "77.68.33.97" || !evt.Rejected {
+		t.Errorf("unexpected event: %+v", evt)
+	}
+}
+
 func TestLogTailerReadsNewLines(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "test.log")

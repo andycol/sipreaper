@@ -1,0 +1,25 @@
+[Unit]
+Description=SIPReaper - SIP Attack Detection and Banning
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sipreaper daemon --config /etc/sipreaper/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Environment (secrets)
+EnvironmentFile=-/etc/sipreaper/env
+
+# Security
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/sipreaper
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
