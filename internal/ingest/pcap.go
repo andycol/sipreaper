@@ -173,9 +173,16 @@ func (pc *PcapCapture) processPacket(packet gopacket.Packet) {
 		return
 	}
 
-	msg, err := ParseSIPMessage(appLayer.Payload())
+	payload := appLayer.Payload()
+	msg, err := ParseSIPMessage(payload)
 	if err != nil {
-		atomic.AddUint64(&pc.pktsParseFail, 1)
+		n := atomic.AddUint64(&pc.pktsParseFail, 1)
+		// One-shot dump: print the first few failing payloads so we can see
+		// what gopacket is actually handing ParseSIPMessage. Emits at most
+		// 5 dumps regardless of traffic to keep journal noise bounded.
+		if n <= 5 {
+			pc.dumpPayload(payload, err)
+		}
 		return
 	}
 
@@ -268,6 +275,30 @@ func (pc *PcapCapture) send(evt models.SIPEvent) {
 	default:
 		log.Println("pcap: event channel full, dropping packet")
 	}
+}
+
+// dumpPayload prints a hex+ascii preview of a payload that ParseSIPMessage
+// rejected. Used only for diagnostics — capped to the first 5 failures.
+func (pc *PcapCapture) dumpPayload(p []byte, parseErr error) {
+	const max = 200
+	n := len(p)
+	if n > max {
+		n = max
+	}
+	prev := p[:n]
+
+	var hex strings.Builder
+	var ascii strings.Builder
+	for _, b := range prev {
+		fmt.Fprintf(&hex, "%02x ", b)
+		if b >= 0x20 && b <= 0x7e {
+			ascii.WriteByte(b)
+		} else {
+			ascii.WriteByte('.')
+		}
+	}
+	log.Printf("pcap: PARSE FAIL (#%d) len=%d err=%q ascii=%q hex=%s",
+		atomic.LoadUint64(&pc.pktsParseFail), len(p), parseErr.Error(), ascii.String(), hex.String())
 }
 
 func buildBPFFilter(ports []int, custom string) string {
