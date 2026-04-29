@@ -115,8 +115,16 @@ func Run(cfgPath string) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := pcapCapture.Run(); err != nil {
-				log.Printf("pcap error: %v", err)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("pcap goroutine PANICKED: %v (recovered) — pcap ingest is now DEAD until daemon restart", r)
+				}
+			}()
+			err := pcapCapture.Run()
+			if err != nil {
+				log.Printf("pcap error: %v — pcap ingest is now DEAD until daemon restart", err)
+			} else {
+				log.Printf("pcap: Run() returned nil — pcap ingest is now DEAD until daemon restart")
 			}
 		}()
 	} else {

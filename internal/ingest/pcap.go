@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andycol/sipreaper/internal/models"
@@ -33,6 +34,11 @@ type PcapCapture struct {
 	// the original sender (the response packet's destination, not source).
 	inflight   map[string]requestRecord
 	inflightMu sync.Mutex
+
+	// Diagnostic counters — atomic so we can read without locking.
+	pktsReceived  uint64
+	pktsNoAppLyr  uint64
+	pktsParseFail uint64
 }
 
 type requestRecord struct {
@@ -104,26 +110,53 @@ func (pc *PcapCapture) pruneInflight() {
 	}
 }
 
-func (pc *PcapCapture) Run() error {
+func (pc *PcapCapture) Run() (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("pcap: PANIC in Run: %v (recovered)", r)
+			retErr = fmt.Errorf("pcap panic: %v", r)
+		}
+	}()
+
 	handle, err := pcap.OpenLive(pc.iface, 65535, false, pcap.BlockForever)
 	if err != nil {
+		log.Printf("pcap: OpenLive failed on %s: %v", pc.iface, err)
 		return fmt.Errorf("opening pcap on %s: %w", pc.iface, err)
 	}
 	defer handle.Close()
 
 	if err := handle.SetBPFFilter(pc.filter); err != nil {
+		log.Printf("pcap: SetBPFFilter failed (filter=%q): %v", pc.filter, err)
 		return fmt.Errorf("setting BPF filter: %w", err)
 	}
 
+	log.Printf("pcap: capture loop entered iface=%s linktype=%s filter=%q", pc.iface, handle.LinkType(), pc.filter)
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+
+	// Heartbeat so we can tell if packets are arriving at all.
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
 	for {
 		select {
 		case <-pc.done:
+			log.Printf("pcap: Run exiting on done signal (recv=%d noapp=%d parsefail=%d)",
+				atomic.LoadUint64(&pc.pktsReceived),
+				atomic.LoadUint64(&pc.pktsNoAppLyr),
+				atomic.LoadUint64(&pc.pktsParseFail))
 			return nil
+		case <-heartbeat.C:
+			log.Printf("pcap: heartbeat recv=%d noapp=%d parsefail=%d",
+				atomic.LoadUint64(&pc.pktsReceived),
+				atomic.LoadUint64(&pc.pktsNoAppLyr),
+				atomic.LoadUint64(&pc.pktsParseFail))
 		case packet, ok := <-packetSource.Packets():
 			if !ok {
+				log.Printf("pcap: Run exiting — packet source channel CLOSED (recv=%d). This usually means libpcap returned an error mid-read.",
+					atomic.LoadUint64(&pc.pktsReceived))
 				return nil
 			}
+			atomic.AddUint64(&pc.pktsReceived, 1)
 			pc.processPacket(packet)
 		}
 	}
@@ -136,11 +169,13 @@ func (pc *PcapCapture) Stop() {
 func (pc *PcapCapture) processPacket(packet gopacket.Packet) {
 	appLayer := packet.ApplicationLayer()
 	if appLayer == nil {
+		atomic.AddUint64(&pc.pktsNoAppLyr, 1)
 		return
 	}
 
 	msg, err := ParseSIPMessage(appLayer.Payload())
 	if err != nil {
+		atomic.AddUint64(&pc.pktsParseFail, 1)
 		return
 	}
 
