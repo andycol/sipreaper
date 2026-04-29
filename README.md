@@ -1,4 +1,5 @@
-# SIPReaper
+<img width="1254" height="1254" alt="image" src="https://github.com/user-attachments/assets/23df436c-fe0a-4fc5-8a9e-87536ae64754" />
+
 
 SIP attack detection and automatic IP banning for Kamailio and OpenSIPS. Think fail2ban, but purpose-built for SIP with deep protocol awareness, configurable thresholds, and a management API.
 
