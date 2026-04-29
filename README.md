@@ -2,6 +2,8 @@
 
 SIP attack detection and automatic IP banning for Kamailio and OpenSIPS. Think fail2ban, but purpose-built for SIP with deep protocol awareness, configurable thresholds, and a management API.
 
+For a narrative explanation of how the system works end-to-end and the design choices behind it, see [`docs/how-it-works.md`](docs/how-it-works.md).
+
 ## Features
 
 - **Dual ingest** — log files (kamailio + opensips formats, auto-cascade) and live packet capture
