@@ -167,19 +167,26 @@ func (pc *PcapCapture) Stop() {
 }
 
 func (pc *PcapCapture) processPacket(packet gopacket.Packet) {
-	appLayer := packet.ApplicationLayer()
-	if appLayer == nil {
+	// Use the transport-layer payload (everything after the UDP header) rather
+	// than ApplicationLayer().Payload(). gopacket's built-in layers.SIP decoder
+	// auto-fires on UDP/5060 and UDP/5061 and consumes the headers into struct
+	// fields, leaving Payload() pointing at only the message body. For
+	// header-only SIP messages (REGISTER, 401, OPTIONS) the body is empty, so
+	// ParseSIPMessage would reject every packet.
+	transport := packet.TransportLayer()
+	if transport == nil {
+		atomic.AddUint64(&pc.pktsNoAppLyr, 1)
+		return
+	}
+	payload := transport.LayerPayload()
+	if len(payload) == 0 {
 		atomic.AddUint64(&pc.pktsNoAppLyr, 1)
 		return
 	}
 
-	payload := appLayer.Payload()
 	msg, err := ParseSIPMessage(payload)
 	if err != nil {
 		n := atomic.AddUint64(&pc.pktsParseFail, 1)
-		// One-shot dump: print the first few failing payloads so we can see
-		// what gopacket is actually handing ParseSIPMessage. Emits at most
-		// 5 dumps regardless of traffic to keep journal noise bounded.
 		if n <= 5 {
 			pc.dumpPayload(payload, err)
 		}
