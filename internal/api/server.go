@@ -23,6 +23,8 @@ type Server struct {
 	isWhitelisted   func(net.IP) bool
 	unbanFn         func(net.IP) error
 	reloadWhitelist func()
+	xdpStatus       func() map[string]interface{}
+	xdpDetach       func() string
 }
 
 func NewServer(s *store.Store, token, listen string) *Server {
@@ -51,6 +53,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/whitelist/{ip}", s.authMiddleware(s.handleRemoveWhitelist))
 	mux.HandleFunc("GET /api/v1/events", s.authMiddleware(s.handleListEvents))
 	mux.HandleFunc("GET /api/v1/stats", s.authMiddleware(s.handleStats))
+	mux.HandleFunc("GET /api/v1/xdp/status", s.authMiddleware(s.handleXdpStatus))
+	mux.HandleFunc("POST /api/v1/xdp/detach", s.authMiddleware(s.handleXdpDetach))
 
 	// /healthz is intentionally unauthenticated so monitoring (k8s probes,
 	// load balancers) can hit it without secrets. It returns no sensitive
@@ -103,6 +107,19 @@ func (s *Server) SetUnbanFunc(fn func(net.IP) error) {
 // into the running engine after it changes via the API.
 func (s *Server) SetReloadWhitelistFunc(fn func()) {
 	s.reloadWhitelist = fn
+}
+
+// SetXdpStatusFunc wires a callback returning the current XDP enforcer status
+// (attached, mode, map sizes, last reconcile) for GET /api/v1/xdp/status.
+func (s *Server) SetXdpStatusFunc(fn func() map[string]interface{}) {
+	s.xdpStatus = fn
+}
+
+// SetXdpDetachFunc wires the no-restart kill switch behind
+// POST /api/v1/xdp/detach: it detaches the XDP program and reverts to the base
+// enforcer. Returns a human-readable status message.
+func (s *Server) SetXdpDetachFunc(fn func() string) {
+	s.xdpDetach = fn
 }
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {

@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Build + unit tests. The committed bpf_bpf*.{go,o} make a local `make build`
+  # toolchain-light (gcc + libpcap only); CI regenerates them first so the
+  # pipeline is green even on a checkout where the objects haven't been
+  # committed yet, and so the build always reflects the current C source.
+  build-test:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.3"
+      - name: Install build + eBPF deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libpcap-dev clang llvm libbpf-dev linux-headers-$(uname -r) bpftool
+      - name: Generate XDP bindings
+        run: make generate
+      - run: go build ./...
+      - run: go test ./... -race
+
+  # Regenerate the XDP bindings and fail if the committed *.go differ. We diff
+  # ONLY the generated Go files, never the .o: object bytes carry debug-info /
+  # endianness noise that differs across toolchain patch versions and would
+  # cause chronic spurious failures. Pin the clang/llvm/bpftool versions so the
+  # generated Go is reproducible.
+  bpf-regen-check:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.3"
+      - name: Install eBPF toolchain (pinned)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-14 llvm-14 libbpf-dev linux-headers-$(uname -r) bpftool gcc libpcap-dev
+          sudo ln -sf /usr/bin/clang-14 /usr/local/bin/clang
+          sudo ln -sf /usr/bin/llvm-strip-14 /usr/local/bin/llvm-strip
+      - run: make generate
+      - name: Fail if generated Go drifted
+        run: git diff --exit-code -- 'internal/banner/*.go'
+
+  # Load + attach the committed object and run the BPF_PROG_TEST_RUN
+  # classification suite on a real (privileged) kernel — catches verifier
+  # regressions a plain build can't. Runs on the default GitHub kernel; extend
+  # the matrix with self-hosted runners on your lowest-supported kernel.
+  bpf-verifier:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.3"
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libpcap-dev clang llvm libbpf-dev linux-headers-$(uname -r) bpftool
+      - name: Generate XDP bindings
+        run: make generate
+      - name: Run privileged banner tests (load + attach + PROG_TEST_RUN)
+        run: sudo -E env "PATH=$PATH" go test ./internal/banner/ -race -run 'TestClassification|TestBanRoundTrip|TestList'

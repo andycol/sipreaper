@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- REGISTER with digest auth. Drive with:
+       sipp <sut>:5060 -sf register.xml -inf users.csv \
+         -r 200 -rp 1000 -l 2000 -m 18000 -trace_stat -fd 1 -trace_err \
+         -i <load-ip> -p 5060 -nd -timeout 5s
+     users.csv supplies [field0]=user [field1]=password. -->
+<scenario name="REGISTER with auth">
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:[remote_ip] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@[remote_ip]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>
+      Max-Forwards: 70
+      Expires: 600
+      User-Agent: sipp-bench
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <recv response="401" auth="true" rtd="true"/>
+
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:[remote_ip] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@[remote_ip]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>
+      [authentication username=[field0] password=[field1]]
+      Max-Forwards: 70
+      Expires: 600
+      User-Agent: sipp-bench
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <recv response="200" rtd="true"/>
+
+  <ResponseTimeRepartition value="10, 20, 50, 100, 200, 500, 1000"/>
+  <CallLengthRepartition value="10, 50, 100, 200, 500, 1000"/>
+</scenario>

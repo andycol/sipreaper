@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- REGISTER with digest auth over TLS (port 5061). Drive with `-t l1` so sipp
+     uses a single TLS socket, exercising the TCP/TLS drop path and the
+     mid-stream teardown of in-flight calls from a banned source:
+       sipp <sut>:5061 -sf register_tls.xml -inf users.csv -t l1 \
+         -tls_cert client.pem -tls_key client.key \
+         -r 100 -rp 1000 -l 1000 -m 9000 -trace_stat -fd 1 -stf tls.csv \
+         -trace_err -i <load-ip> -p 5061 -nd -timeout 5s
+     [transport] resolves to TLS automatically under -t l1. -->
+<scenario name="REGISTER with auth over TLS">
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:[remote_ip] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@[remote_ip]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>
+      Max-Forwards: 70
+      Expires: 600
+      User-Agent: sipp-bench-tls
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <recv response="401" auth="true" rtd="true"/>
+
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:[remote_ip] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@[remote_ip]>;tag=[call_number]
+      To: <sip:[field0]@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>
+      [authentication username=[field0] password=[field1]]
+      Max-Forwards: 70
+      Expires: 600
+      User-Agent: sipp-bench-tls
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <recv response="200" rtd="true"/>
+
+  <ResponseTimeRepartition value="10, 20, 50, 100, 200, 500, 1000"/>
+  <CallLengthRepartition value="10, 50, 100, 200, 500, 1000"/>
+</scenario>

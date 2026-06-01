@@ -1,0 +1,67 @@
+# Prometheus alerting rules for the sipreaper XDP enforcer.
+#
+# Load these into your Prometheus rule files (rule_files: in prometheus.yml).
+# They target the metrics exported at /metrics by sipreaper. The headline alert
+# is XdpSilentlyDegraded: the design deliberately fails open to iptables, so an
+# operator MUST be told when XDP is configured but not actually attached.
+groups:
+  - name: sipreaper-xdp
+    rules:
+      # Critical: XDP is meant to be on but the program is not attached. The
+      # base iptables/ipset enforcer is still protecting (fail-open worked), but
+      # the kernel fast path you provisioned for is silently absent.
+      #
+      # Requires a config-intent signal scraped alongside the metric. If you
+      # don't export config, alert purely on a sustained 0 while you expect 1.
+      - alert: XdpSilentlyDegraded
+        expr: max(sipreaper_xdp_attached) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "sipreaper XDP not attached"
+          description: >
+            enforcer.xdp is expected to be attached but sipreaper_xdp_attached
+            is 0 for 5m. The daemon has fallen open to the iptables/ipset base
+            enforcer. Check the startup logs for "xdp preflight/attach failed".
+
+      # Warning: attached in generic (SKB) mode when native was expected — the
+      # %soft win is much smaller in generic mode.
+      - alert: XdpGenericMode
+        expr: sipreaper_xdp_attached{mode="generic"} == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sipreaper XDP running in generic mode"
+          description: >
+            XDP attached in generic/SKB mode. If the NIC/driver supports native
+            XDP, investigate; generic mode runs after the RX softirq + GRO so the
+            flood-absorption benefit is reduced.
+
+      # Warning: ban map approaching its max_entries (1<<20 per family). At
+      # capacity, new bans error (E2BIG) and only the composite iptables backend
+      # absorbs them.
+      - alert: XdpMapNearFull
+        expr: max(sipreaper_xdp_map_entries) / 1048576 > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sipreaper XDP ban map > 80% full"
+          description: >
+            An XDP ban map is over 80% of its 1,048,576-entry capacity. Raise
+            max_entries in internal/banner/bpf/xdp_ban.c and regenerate, or rely
+            on the composite iptables backend for overflow.
+
+      # Warning: enforcer ban errors sustained — most likely the map is full.
+      - alert: XdpEnforcerBanErrors
+        expr: rate(sipreaper_enforcer_errors_total{op="ban"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sipreaper enforcer ban errors"
+          description: >
+            Sustained ban errors. Check whether the XDP map is full (see
+            XdpMapNearFull) or a backend is misconfigured.

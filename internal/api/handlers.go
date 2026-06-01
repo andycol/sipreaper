@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/andycol/sipreaper/internal/models"
@@ -259,6 +260,23 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *Server) handleXdpStatus(w http.ResponseWriter, r *http.Request) {
+	if s.xdpStatus == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"enabled": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.xdpStatus())
+}
+
+func (s *Server) handleXdpDetach(w http.ResponseWriter, r *http.Request) {
+	if s.xdpDetach == nil {
+		http.Error(w, "xdp not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	msg := s.xdpDetach()
+	writeJSON(w, http.StatusOK, map[string]string{"status": msg})
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	checks := map[string]string{}
 	if err := s.store.HealthCheck(); err != nil {
@@ -273,11 +291,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A "degraded:"-prefixed value is informational and must NOT fail the probe
+	// (fail-open ethos — e.g. XDP enabled-but-not-attached while the base
+	// enforcer still protects). Only hard-down subsystems flip /healthz to 503.
 	overall := http.StatusOK
+	degraded := false
 	for _, v := range checks {
-		if v != "ok" {
+		switch {
+		case v == "ok":
+		case strings.HasPrefix(v, "ok"), strings.HasPrefix(v, "degraded"):
+			degraded = true
+		default:
 			overall = http.StatusServiceUnavailable
-			break
 		}
 	}
 
@@ -287,6 +312,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"uptime": time.Since(s.startTime).String(),
 	}
 	if overall != http.StatusOK {
+		resp["status"] = "unhealthy"
+	} else if degraded {
 		resp["status"] = "degraded"
 	}
 	writeJSON(w, overall, resp)

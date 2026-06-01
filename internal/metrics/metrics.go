@@ -53,4 +53,35 @@ var (
 		Name: "sipreaper_detector_panics_total",
 		Help: "Recovered panics in detector or action pipeline, labelled by component.",
 	}, []string{"component"})
+
+	// --- XDP enforcer -----------------------------------------------------
+
+	// XdpAttached is 1 while the XDP program is attached, 0 otherwise, labelled
+	// by attach mode (driver/generic). The critical silent-degradation alert
+	// fires on `enforcer.xdp.enabled` true but this == 0.
+	XdpAttached = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sipreaper_xdp_attached",
+		Help: "1 when the XDP program is attached, labelled by mode (driver/generic).",
+	}, []string{"mode"})
+
+	// XdpMapEntries is the live size of each ban map, labelled by family.
+	XdpMapEntries = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sipreaper_xdp_map_entries",
+		Help: "Number of IPs in the XDP ban map, labelled by family (v4/v6).",
+	}, []string{"family"})
+
+	// XdpPackets holds the cumulative per-result packet counts the kernel
+	// program maintains (result=passed|dropped). Exposed as a gauge because the
+	// value is the kernel's running total, refreshed on a ticker.
+	XdpPackets = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sipreaper_xdp_packets",
+		Help: "Cumulative packets handled by the XDP program, labelled by result (passed/dropped).",
+	}, []string{"result"})
+
+	// XdpReconcileRemoved counts map entries removed by reconcile (stale or
+	// newly-whitelisted) — surfaces DB<->map drift.
+	XdpReconcileRemoved = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "sipreaper_xdp_reconcile_removed_total",
+		Help: "XDP map entries removed by reconcile (stale or whitelisted).",
+	})
 )
