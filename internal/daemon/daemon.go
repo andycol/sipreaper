@@ -206,6 +206,18 @@ func Run(cfgPath, tokenOverride string) error {
 
 	// Start API server
 	srv := api.NewServer(s, token, cfg.API.Listen)
+	if cfg.Detectors.GeoAnomaly.GeoIPDB != "" {
+		resolver, err := detect.NewMaxMindResolver(cfg.Detectors.GeoAnomaly.GeoIPDB)
+		if err != nil {
+			log.Printf("warning: ban country lookup disabled: %v", err)
+		} else {
+			defer resolver.Close()
+			srv.SetCountryLookupFunc(func(ip net.IP) (string, string, bool) {
+				code, name, err := resolver.CountryInfo(ip)
+				return code, name, err == nil && code != ""
+			})
+		}
+	}
 	if logTailer != nil {
 		srv.SetLogTailerStats(func() (uint64, uint64) { return logTailer.Stats() })
 	}
