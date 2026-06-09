@@ -480,7 +480,7 @@ All `/api/v1/*` endpoints require `Authorization: Bearer <token>`. `/healthz` an
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/api/v1/status` | yes | Daemon health, uptime, active ban count |
-| `GET` | `/api/v1/bans` | yes | List bans. Defaults to `status=current` (`active` + `manual`). Query params: `status` (`current`/`active`/`expired`/`manual`/`dry_run`), `ip` |
+| `GET` | `/api/v1/bans` | yes | List bans. Defaults to `status=current` (`active` + `manual`). Query params: `status` (`current`/`active`/`expired`/`manual`/`dry_run`), `ip`, `limit`, `offset`. Without pagination params this returns the legacy array shape; with `limit`/`offset` it returns `{items,total,limit,offset}`. When a GeoIP database is configured, ban rows include `country_code` and `country_name`; otherwise those fields are `null`. |
 | `POST` | `/api/v1/bans` | yes | Manual ban. Body: `{"ip": "1.2.3.4", "duration": "1h"}`. Applies the firewall rule before returning success. Returns **409** if IP is whitelisted or already banned, **400** if invalid. |
 | `DELETE` | `/api/v1/bans/{ip}` | yes | Unban an IP from the active enforcer and mark its ban expired |
 | `GET` | `/api/v1/whitelist` | yes | List whitelist entries |

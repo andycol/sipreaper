@@ -10,7 +10,7 @@ import (
 type SIPEvent struct {
 	Timestamp    time.Time `json:"timestamp"`
 	SourceIP     net.IP    `json:"source_ip"`
-	Method       string    `json:"method"`     // REGISTER, INVITE, OPTIONS, etc.
+	Method       string    `json:"method"` // REGISTER, INVITE, OPTIONS, etc.
 	UserAgent    string    `json:"user_agent"`
 	FromUser     string    `json:"from_user"`
 	ToUser       string    `json:"to_user"`
@@ -71,10 +71,14 @@ type BanEntry struct {
 	Reason    string        `json:"reason"`
 	Severity  string        `json:"severity"`
 	BannedAt  time.Time     `json:"banned_at"`
-	Duration  time.Duration `json:"-"` // surfaced via MarshalJSON as integer seconds
+	Duration  time.Duration `json:"-"`          // surfaced via MarshalJSON as integer seconds
 	ExpiresAt *time.Time    `json:"expires_at"` // nil if permanent
 	BanCount  int           `json:"ban_count"`
 	Status    string        `json:"status"` // "active", "expired", "manual", "dry_run"
+	// Optional enrichment supplied by the API layer when a GeoIP database is
+	// configured. These fields are not persisted in SQLite.
+	CountryCode *string `json:"country_code"`
+	CountryName *string `json:"country_name"`
 }
 
 // MarshalJSON serialises Duration as integer seconds.

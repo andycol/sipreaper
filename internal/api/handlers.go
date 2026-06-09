@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,7 +27,49 @@ func (s *Server) handleListBans(w http.ResponseWriter, r *http.Request) {
 	if status == "" {
 		status = "current"
 	}
-	bans, err := s.store.ListBansFiltered(status, r.URL.Query().Get("ip"))
+	ip := r.URL.Query().Get("ip")
+	limit, limitSet, err := parseNonNegativeIntQuery(r, "limit")
+	if err != nil {
+		http.Error(w, "invalid limit", http.StatusBadRequest)
+		return
+	}
+	offset, offsetSet, err := parseNonNegativeIntQuery(r, "offset")
+	if err != nil {
+		http.Error(w, "invalid offset", http.StatusBadRequest)
+		return
+	}
+
+	if limitSet || offsetSet {
+		if limit == 0 {
+			limit = 50
+		}
+		if limit > 500 {
+			limit = 500
+		}
+		bans, err := s.store.ListBansFilteredPage(status, ip, limit, offset)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		total, err := s.store.CountBansFiltered(status, ip)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if bans == nil {
+			bans = []models.BanEntry{}
+		}
+		s.enrichBanCountries(bans)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"items":  bans,
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+		})
+		return
+	}
+
+	bans, err := s.store.ListBansFiltered(status, ip)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -34,7 +77,42 @@ func (s *Server) handleListBans(w http.ResponseWriter, r *http.Request) {
 	if bans == nil {
 		bans = []models.BanEntry{}
 	}
+	s.enrichBanCountries(bans)
 	writeJSON(w, http.StatusOK, bans)
+}
+
+func parseNonNegativeIntQuery(r *http.Request, name string) (int, bool, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return 0, false, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return 0, true, fmt.Errorf("invalid %s", name)
+	}
+	return value, true, nil
+}
+
+func (s *Server) enrichBanCountries(bans []models.BanEntry) {
+	if s.countryLookup == nil {
+		return
+	}
+	for i := range bans {
+		ip := net.ParseIP(bans[i].IP)
+		if ip == nil {
+			continue
+		}
+		code, name, ok := s.countryLookup(ip)
+		if !ok {
+			continue
+		}
+		if code != "" {
+			bans[i].CountryCode = &code
+		}
+		if name != "" {
+			bans[i].CountryName = &name
+		}
+	}
 }
 
 type createBanRequest struct {

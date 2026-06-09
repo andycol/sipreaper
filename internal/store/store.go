@@ -114,6 +114,61 @@ func (s *Store) ListBans(status string) ([]models.BanEntry, error) {
 
 func (s *Store) ListBansFiltered(status, ip string) ([]models.BanEntry, error) {
 	query := `SELECT id, ip, detector, reason, severity, banned_at, duration, expires_at, ban_count, status FROM bans`
+	where, args := banFilters(status, ip)
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, ` AND `)
+	}
+	query += ` ORDER BY banned_at DESC`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanBans(rows)
+}
+
+func (s *Store) ListBansFilteredPage(status, ip string, limit, offset int) ([]models.BanEntry, error) {
+	if limit <= 0 {
+		return s.ListBansFiltered(status, ip)
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	query := `SELECT id, ip, detector, reason, severity, banned_at, duration, expires_at, ban_count, status FROM bans`
+	where, args := banFilters(status, ip)
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, ` AND `)
+	}
+	query += ` ORDER BY banned_at DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanBans(rows)
+}
+
+func (s *Store) CountBansFiltered(status, ip string) (int, error) {
+	query := `SELECT COUNT(*) FROM bans`
+	where, args := banFilters(status, ip)
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, ` AND `)
+	}
+
+	var count int
+	if err := s.db.QueryRow(query, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func banFilters(status, ip string) ([]string, []interface{}) {
 	var args []interface{}
 	var where []string
 	switch status {
@@ -128,18 +183,7 @@ func (s *Store) ListBansFiltered(status, ip string) ([]models.BanEntry, error) {
 		where = append(where, `ip = ?`)
 		args = append(args, ip)
 	}
-	if len(where) > 0 {
-		query += ` WHERE ` + strings.Join(where, ` AND `)
-	}
-	query += ` ORDER BY banned_at DESC`
-
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	return scanBans(rows)
+	return where, args
 }
 
 func (s *Store) ListEnforcedBans() ([]models.BanEntry, error) {
