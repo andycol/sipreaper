@@ -89,8 +89,42 @@ func TestListBans(t *testing.T) {
 	}
 }
 
+func TestListBansFiltersByIP(t *testing.T) {
+	srv, s := newTestServer(t)
+
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2"} {
+		s.CreateBan(models.BanEntry{
+			IP: ip, Detector: "brute_force", Reason: "test",
+			Severity: "high", BannedAt: time.Now(), Duration: 5 * time.Minute,
+			BanCount: 1, Status: "active",
+		})
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/bans?ip=10.0.0.2", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200", w.Code)
+	}
+	var bans []models.BanEntry
+	json.NewDecoder(w.Body).Decode(&bans)
+	if len(bans) != 1 || bans[0].IP != "10.0.0.2" {
+		t.Fatalf("bans = %+v, want only 10.0.0.2", bans)
+	}
+}
+
 func TestManualBan(t *testing.T) {
 	srv, s := newTestServer(t)
+	var applied net.IP
+	var appliedDuration time.Duration
+	srv.SetBanFunc(func(ip net.IP, d time.Duration, reason string) error {
+		applied = ip
+		appliedDuration = d
+		return nil
+	})
 
 	body := `{"ip": "10.0.0.5", "duration": "1h"}`
 	req := httptest.NewRequest("POST", "/api/v1/bans", strings.NewReader(body))
@@ -110,6 +144,12 @@ func TestManualBan(t *testing.T) {
 	}
 	if ban.Status != "manual" {
 		t.Errorf("status = %q, want manual", ban.Status)
+	}
+	if applied == nil || applied.String() != "10.0.0.5" {
+		t.Fatalf("ban callback got %v, want 10.0.0.5", applied)
+	}
+	if appliedDuration != time.Hour {
+		t.Fatalf("ban callback duration = %s, want 1h", appliedDuration)
 	}
 }
 
@@ -155,6 +195,8 @@ func TestManualUnban(t *testing.T) {
 		Severity: "medium", BannedAt: time.Now(), Duration: 0,
 		BanCount: 1, Status: "manual",
 	})
+	var unbanned net.IP
+	srv.SetUnbanFunc(func(ip net.IP) error { unbanned = ip; return nil })
 
 	req := httptest.NewRequest("DELETE", "/api/v1/bans/10.0.0.1", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
@@ -169,6 +211,9 @@ func TestManualUnban(t *testing.T) {
 	ban, _ := s.GetActiveBanByIP("10.0.0.1")
 	if ban != nil {
 		t.Error("ban should have been removed")
+	}
+	if unbanned == nil || unbanned.String() != "10.0.0.1" {
+		t.Fatalf("unban callback got %v, want 10.0.0.1", unbanned)
 	}
 }
 
@@ -190,6 +235,65 @@ func TestAddWhitelistRefusesBannedIP(t *testing.T) {
 
 	if w.Code != http.StatusConflict {
 		t.Errorf("status code = %d, want 409 for banned IP", w.Code)
+	}
+}
+
+func TestAddWhitelistRefusesCIDROverlappingCurrentBan(t *testing.T) {
+	srv, s := newTestServer(t)
+	s.CreateBan(models.BanEntry{
+		IP: "10.1.2.3", Detector: "brute_force", Reason: "test",
+		Severity: "high", BannedAt: time.Now(), Duration: time.Hour,
+		BanCount: 1, Status: "active",
+	})
+
+	body := `{"ip": "10.0.0.0/8", "comment": "internal"}`
+	req := httptest.NewRequest("POST", "/api/v1/whitelist", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status code = %d, want 409 for overlapping CIDR", w.Code)
+	}
+}
+
+func TestAddWhitelistClearBanForCIDR(t *testing.T) {
+	srv, s := newTestServer(t)
+	for _, ip := range []string{"10.1.2.3", "10.2.3.4"} {
+		s.CreateBan(models.BanEntry{
+			IP: ip, Detector: "brute_force", Reason: "test",
+			Severity: "high", BannedAt: time.Now(), Duration: time.Hour,
+			BanCount: 1, Status: "active",
+		})
+	}
+
+	var unbanned []string
+	srv.SetUnbanFunc(func(ip net.IP) error {
+		unbanned = append(unbanned, ip.String())
+		return nil
+	})
+
+	body := `{"ip": "10.0.0.0/8", "comment": "internal", "clear_ban": true}`
+	req := httptest.NewRequest("POST", "/api/v1/whitelist", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status code = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	if len(unbanned) != 2 {
+		t.Fatalf("unbanned = %v, want two IPs", unbanned)
+	}
+	for _, ip := range []string{"10.1.2.3", "10.2.3.4"} {
+		ban, _ := s.GetActiveBanByIP(ip)
+		if ban != nil {
+			t.Fatalf("ban for %s should be expired", ip)
+		}
 	}
 }
 
@@ -259,5 +363,24 @@ func TestListWhitelist(t *testing.T) {
 	json.NewDecoder(w.Body).Decode(&entries)
 	if len(entries) != 1 {
 		t.Fatalf("whitelist len = %d, want 1", len(entries))
+	}
+}
+
+func TestRemoveWhitelistAcceptsCIDRPath(t *testing.T) {
+	srv, s := newTestServer(t)
+	s.AddWhitelist("10.0.0.0/8", "test", "dynamic")
+
+	req := httptest.NewRequest("DELETE", "/api/v1/whitelist/10.0.0.0/8", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200", w.Code)
+	}
+	entries, _ := s.ListWhitelist()
+	if len(entries) != 0 {
+		t.Fatalf("whitelist entries = %+v, want empty", entries)
 	}
 }

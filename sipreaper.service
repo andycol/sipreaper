@@ -18,8 +18,23 @@ User=root
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/sipreaper
+# /sys/fs/bpf holds the pinned XDP maps (ban state across restarts); required
+# under ProtectSystem=strict.
+ReadWritePaths=/var/lib/sipreaper /sys/fs/bpf
 PrivateTmp=yes
+
+# XDP enforcer (enforcer.xdp.enabled=true). These are inert when XDP is
+# disabled, so they are safe to ship unconditionally.
+#   CAP_NET_RAW   — already needed by the pcap ingest tap.
+#   CAP_NET_ADMIN — attach/detach the XDP program on the NIC.
+#   CAP_BPF       — load programs + create/update BPF maps (kernel >= 5.8).
+# On kernels < 5.8 there is no CAP_BPF: add CAP_SYS_ADMIN (and CAP_SYS_RESOURCE
+# for RLIMIT_MEMLOCK) to the two lines below instead.
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW
+# Refuse to start without bpffs rather than silently degrading at runtime; the
+# daemon additionally write-probes the pin dir and fails open if it can't pin.
+RequiresMountsFor=/sys/fs/bpf
 
 [Install]
 WantedBy=multi-user.target

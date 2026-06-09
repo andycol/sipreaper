@@ -45,16 +45,16 @@ type PcapIngestConfig struct {
 }
 
 type DetectorsConfig struct {
-	BruteForce     BruteForceConfig     `mapstructure:"brute_force"`
-	InviteFlood    InviteFloodConfig    `mapstructure:"invite_flood"`
-	Scanner        ScannerConfig        `mapstructure:"scanner"`
-	InvalidRequest InvalidRequestConfig `mapstructure:"invalid_request"`
-	GeoAnomaly     GeoAnomalyConfig     `mapstructure:"geo_anomaly"`
-	UserEnum       UserEnumConfig       `mapstructure:"user_enum"`
-	ServerRejected ServerRejectedConfig `mapstructure:"server_rejected"`
-	Honeypot       HoneypotConfig       `mapstructure:"honeypot"`
+	BruteForce      BruteForceConfig      `mapstructure:"brute_force"`
+	InviteFlood     InviteFloodConfig     `mapstructure:"invite_flood"`
+	Scanner         ScannerConfig         `mapstructure:"scanner"`
+	InvalidRequest  InvalidRequestConfig  `mapstructure:"invalid_request"`
+	GeoAnomaly      GeoAnomalyConfig      `mapstructure:"geo_anomaly"`
+	UserEnum        UserEnumConfig        `mapstructure:"user_enum"`
+	ServerRejected  ServerRejectedConfig  `mapstructure:"server_rejected"`
+	Honeypot        HoneypotConfig        `mapstructure:"honeypot"`
 	FailedCallRatio FailedCallRatioConfig `mapstructure:"failed_call_ratio"`
-	DIDScanner     DIDScannerConfig     `mapstructure:"did_scanner"`
+	DIDScanner      DIDScannerConfig      `mapstructure:"did_scanner"`
 }
 
 type BruteForceConfig struct {
@@ -73,7 +73,7 @@ type ScannerConfig struct {
 	Enabled     bool          `mapstructure:"enabled"`
 	MaxProbes   int           `mapstructure:"max_probes"`
 	Window      time.Duration `mapstructure:"window"`
-	KnownAgents []string     `mapstructure:"known_agents"`
+	KnownAgents []string      `mapstructure:"known_agents"`
 }
 
 type InvalidRequestConfig struct {
@@ -144,13 +144,32 @@ type EnforcerConfig struct {
 	// PreFilter is the per-IP pre-filter rate limit applied at chain init for
 	// INVITE traffic. Optional — leave Rate=0 to disable.
 	PreFilter PreFilterConfig `mapstructure:"prefilter"`
+	// XDP layers a kernel-fastpath source-IP drop on top of (or, once proven,
+	// in place of) the iptables/ipset backend. Disabled by default; enabling
+	// is purely additive (see Standalone).
+	XDP XDPConfig `mapstructure:"xdp"`
+}
+
+type XDPConfig struct {
+	// Enabled layers the XDP enforcer on top of Type. If XDP can't attach
+	// (unsupported NIC/kernel, bpffs missing, another XDP prog present) the
+	// daemon logs a warning and stays on the base enforcer — fail-open.
+	Enabled bool `mapstructure:"enabled"`
+	// Interface is the SIP-facing NIC to attach to. Defaults to
+	// ingest.pcap.interface when empty.
+	Interface string `mapstructure:"interface"`
+	// Mode is "" (auto: try native driver then generic), "native", or "generic".
+	Mode string `mapstructure:"mode"`
+	// Standalone makes XDP the ONLY backend (no iptables/ipset per-IP rules).
+	// Only flip this on after the Phase 5 benchmark proves parity-or-better.
+	Standalone bool `mapstructure:"standalone"`
 }
 
 type PreFilterConfig struct {
-	Enabled bool   `mapstructure:"enabled"`
-	Rate    int    `mapstructure:"rate"`        // INVITEs per second per IP
-	Burst   int    `mapstructure:"burst"`       // hashlimit burst
-	Ports   []int  `mapstructure:"ports"`       // SIP ports to apply to
+	Enabled bool  `mapstructure:"enabled"`
+	Rate    int   `mapstructure:"rate"`  // INVITEs per second per IP
+	Burst   int   `mapstructure:"burst"` // hashlimit burst
+	Ports   []int `mapstructure:"ports"` // SIP ports to apply to
 }
 
 type NotifiersConfig struct {
@@ -203,6 +222,9 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("enforcer.prefilter.rate", 5)
 	v.SetDefault("enforcer.prefilter.burst", 10)
 	v.SetDefault("enforcer.prefilter.ports", []int{5060, 5061})
+	v.SetDefault("enforcer.xdp.enabled", false)
+	v.SetDefault("enforcer.xdp.mode", "")
+	v.SetDefault("enforcer.xdp.standalone", false)
 	v.SetDefault("bans.durations", []string{"5m", "30m", "2h", "24h", "0s"})
 	v.SetDefault("bans.cooldown", "48h")
 	v.SetDefault("bans.check_interval", "30s")
@@ -259,6 +281,9 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("ingest.log.format %q: must be kamailio or opensips", c.Ingest.Log.Format)
 		}
+	}
+	if c.Ingest.Syslog.Enabled && c.Ingest.Syslog.Listen == "" {
+		return fmt.Errorf("ingest.syslog.listen is required when syslog ingest is enabled")
 	}
 
 	if c.Ingest.Pcap.Enabled {
@@ -371,6 +396,16 @@ func (c *Config) Validate() error {
 		}
 		if c.Enforcer.PreFilter.Burst < 1 {
 			return fmt.Errorf("enforcer.prefilter.burst must be >= 1 when enabled")
+		}
+	}
+	if c.Enforcer.XDP.Enabled {
+		switch c.Enforcer.XDP.Mode {
+		case "", "auto", "native", "driver", "generic", "skb":
+		default:
+			return fmt.Errorf("enforcer.xdp.mode %q: must be \"\", native or generic", c.Enforcer.XDP.Mode)
+		}
+		if c.Enforcer.XDP.Interface == "" && c.Ingest.Pcap.Interface == "" {
+			return fmt.Errorf("enforcer.xdp.enabled requires enforcer.xdp.interface or ingest.pcap.interface")
 		}
 	}
 

@@ -73,13 +73,39 @@ cd sipreaper
 make build
 ```
 
-This produces a `sipreaper` binary in the project root.
+This produces a `sipreaper` binary in the project root. The compiled XDP
+object is committed and embedded into the binary, so `make build` needs only
+the runtime toolchain above — **not** the eBPF toolchain.
+
+### Regenerating the XDP object (optional)
+
+You only need this if you change `internal/banner/bpf/xdp_ban.c`. It requires
+clang/LLVM ≥ 11, libbpf headers and kernel headers, and runs only on Linux:
+
+**Debian/Ubuntu:**
+```bash
+sudo apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r) bpftool
+make generate   # re-emits internal/banner/bpf_bpf{el,eb}.{go,o}
+```
+
+**RHEL/CentOS/Rocky:**
+```bash
+sudo yum install -y clang llvm libbpf-devel kernel-headers bpftool
+make generate
+```
+
+Commit the regenerated `internal/banner/bpf_bpf*.{go,o}`. CI verifies the
+generated `.go` is reproducible (the `.o` is not byte-diffed — see `ci.yml`).
 
 ### Run Tests
 
 ```bash
 make test
 ```
+
+The XDP load/attach/classification tests (`internal/banner`) are Linux-only and
+skip automatically without root/BTF; run them privileged to exercise the kernel
+path: `sudo -E go test ./internal/banner/ -run TestClassification`.
 
 ## Configuration
 
@@ -251,16 +277,28 @@ enforcer:
     rate: 5                  # INVITEs per second per source IP
     burst: 10
     ports: [5060, 5061]
+
+  # XDP kernel-fastpath drop. Drops banned IPs at the NIC/driver layer
+  # (XDP_DROP), before netfilter AND before the AF_PACKET tap. Additive and
+  # fail-open: if it can't attach, the daemon stays on `type` above.
+  # See docs/runbook-xdp.md. Needs kernel >= 5.7, bpffs, CAP_BPF+CAP_NET_ADMIN.
+  xdp:
+    enabled: false
+    interface: ""            # default: ingest.pcap.interface
+    mode: ""                 # "" auto (native->generic) | native | generic
+    standalone: false        # true = ONLY backend (after Phase 5 benchmark)
 ```
 
-**Two enforcer backends:**
+**Three enforcer backends:**
 
 - **`iptables`** (default): one `-j DROP` rule per banned IP, in a dedicated `SIPREAPER` chain linked from `INPUT`. Simple, universal. Linear lookup per packet — fine up to a few thousand bans.
 - **`ipset`**: a single `hash:net` set; one match-rule jumps to it. Lookup is O(1) regardless of ban count. Recommended for any production deployment that's likely to accumulate >1k bans. Requires the `ipset` binary on the host.
 
+- **`xdp`** (optional, layered via `enforcer.xdp.enabled`): an eBPF program at the NIC/driver layer that returns `XDP_DROP` for banned source IPs *before* netfilter and *before* the AF_PACKET tap, so a flood pays no softirq cost and dropped packets never reach `tcpdump`/userspace. Rollout is **additive** — a composite enforcer applies each ban to both the iptables/ipset backend AND the XDP map, with iptables as the safety net — and **fail-open**: any load/attach failure leaves the base backend in charge. Flip `standalone: true` only after the `bench/` benchmark proves parity. See [docs/runbook-xdp.md](docs/runbook-xdp.md). Two accepted behavioral changes: detection-blindness on already-banned IPs, and abrupt mid-stream TCP/TLS teardown — both documented in the runbook. Inspect at runtime via `GET /api/v1/xdp/status`; kill switch is `POST /api/v1/xdp/detach`.
+
 Either backend can be paired with the **prefilter** (an iptables `-m hashlimit` rule installed at chain init that drops INVITEs above `rate` per source IP). Userspace detection still runs on whatever traffic isn't dropped, so repeat offenders still earn a proper escalating ban.
 
-On startup, active bans from SQLite are re-applied. `dry_run` records are skipped.
+On startup, active bans from SQLite are re-applied (and, for XDP, the pinned map is reconciled against the DB — the DB always wins). `dry_run` records are skipped; whitelisted IPs are skipped and marked expired.
 
 ### Notifications
 
@@ -292,7 +330,7 @@ api:
 
 The API only listens on localhost by default. Change the listen address if you need remote access (and ensure you're behind a firewall or VPN).
 
-Token compares are constant-time. `/healthz` and `/metrics` are intentionally **unauthenticated** so monitoring probes and Prometheus scrape jobs don't need to hold the bearer token; everything else requires `Authorization: Bearer <token>`.
+Token compares are constant-time. The daemon refuses to start if the configured token environment variable is missing. `/healthz` and `/metrics` are intentionally **unauthenticated** so monitoring probes and Prometheus scrape jobs don't need to hold the bearer token; everything else requires `Authorization: Bearer <token>`.
 
 ### Storage
 
@@ -436,15 +474,17 @@ All `/api/v1/*` endpoints require `Authorization: Bearer <token>`. `/healthz` an
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/api/v1/status` | yes | Daemon health, uptime, active ban count |
-| `GET` | `/api/v1/bans` | yes | List bans. Query params: `status` (`active`/`expired`/`manual`/`dry_run`), `ip` |
-| `POST` | `/api/v1/bans` | yes | Manual ban. Body: `{"ip": "1.2.3.4", "duration": "1h"}`. Returns **409** if IP is whitelisted, **400** if invalid. |
-| `DELETE` | `/api/v1/bans/{ip}` | yes | Unban an IP |
+| `GET` | `/api/v1/bans` | yes | List bans. Defaults to `status=current` (`active` + `manual`). Query params: `status` (`current`/`active`/`expired`/`manual`/`dry_run`), `ip` |
+| `POST` | `/api/v1/bans` | yes | Manual ban. Body: `{"ip": "1.2.3.4", "duration": "1h"}`. Applies the firewall rule before returning success. Returns **409** if IP is whitelisted or already banned, **400** if invalid. |
+| `DELETE` | `/api/v1/bans/{ip}` | yes | Unban an IP from the active enforcer and mark its ban expired |
 | `GET` | `/api/v1/whitelist` | yes | List whitelist entries |
-| `POST` | `/api/v1/whitelist` | yes | Add to whitelist. Body: `{"ip": "10.0.0.0/8", "comment": "...", "clear_ban": false}`. Returns **409** if IP is currently banned (unless `clear_ban: true`); accepts both single IPs and CIDRs. |
-| `DELETE` | `/api/v1/whitelist/{ip}` | yes | Remove from whitelist (and reload running engine) |
+| `POST` | `/api/v1/whitelist` | yes | Add to whitelist. Body: `{"ip": "10.0.0.0/8", "comment": "...", "clear_ban": false}`. Returns **409** if the IP/CIDR overlaps current bans unless `clear_ban: true`; accepts both single IPs and CIDRs. |
+| `DELETE` | `/api/v1/whitelist/{ip-or-cidr}` | yes | Remove from whitelist (and reload running engine) |
 | `GET` | `/api/v1/events` | yes | Query events. Params: `ip`, `detector`, `last` (duration) |
 | `GET` | `/api/v1/stats` | yes | Detection stats, bans by detector, top offenders, log-tailer matched/unmatched counts |
-| `GET` | `/healthz` | no | Subsystem health (store, log tailer, enforcer). 503 if any non-`ok`. |
+| `GET` | `/api/v1/xdp/status` | yes | XDP enforcer status: `attached`, `mode`, `map_entries_v4/v6`, `packets_passed/dropped`, `last_reconcile_removed` |
+| `POST` | `/api/v1/xdp/detach` | yes | No-restart kill switch: detach XDP, revert to the base enforcer |
+| `GET` | `/healthz` | no | Subsystem health (store, log tailer, enforcer, xdp). 503 only on hard-down; `degraded:` checks (e.g. XDP enabled-but-not-attached) stay non-fatal. |
 | `GET` | `/metrics` | no | Prometheus exposition format |
 
 ### Prometheus metrics
@@ -460,6 +500,12 @@ All `/api/v1/*` endpoints require `Authorization: Bearer <token>`. `/healthz` an
 | `sipreaper_log_lines_unmatched_total` | counter | — |
 | `sipreaper_enforcer_errors_total` | counter | `op` (ban/unban) |
 | `sipreaper_detector_panics_total` | counter | `component` (detector name or `action_pipeline`) |
+| `sipreaper_xdp_attached` | gauge | `mode` (driver/generic) — the silent-degradation signal |
+| `sipreaper_xdp_map_entries` | gauge | `family` (v4/v6) |
+| `sipreaper_xdp_packets` | gauge | `result` (passed/dropped) — cumulative |
+| `sipreaper_xdp_reconcile_removed_total` | counter | — |
+
+Prometheus alert rules for the XDP layer ship in [`deploy/alerts.yml`](deploy/alerts.yml) (led by `XdpSilentlyDegraded`).
 
 ### Examples
 
@@ -517,6 +563,7 @@ Place it in `/etc/sipreaper/env` (mode 600) so systemd picks it up. Use a differ
 - `CAP_NET_RAW` capability (for pcap) or run as root
 - `CAP_NET_ADMIN` capability (for iptables) or run as root
 - MaxMind GeoLite2-Country database (if geo_anomaly detector is enabled)
+- **For `enforcer.xdp` only:** kernel ≥ 5.7, kernel BTF, bpffs at `/sys/fs/bpf`, and `CAP_BPF` + `CAP_NET_ADMIN` (on kernels < 5.8, `CAP_SYS_ADMIN` + `CAP_SYS_RESOURCE` instead of `CAP_BPF`). The shipped `sipreaper.service` already declares these and `RequiresMountsFor=/sys/fs/bpf`; they're inert when XDP is disabled. Run `bench/phase0-hostcheck.sh <iface>` to verify support.
 
 ### systemd Service
 
@@ -547,6 +594,11 @@ User=root
 # User=sipreaper
 # AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 # CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+# For enforcer.xdp, add CAP_BPF and (under ProtectSystem=strict) bpffs RW:
+# AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+# ReadWritePaths=/var/lib/sipreaper /sys/fs/bpf
+# RequiresMountsFor=/sys/fs/bpf
+# (the repo's sipreaper.service already includes these)
 
 # Hardening
 NoNewPrivileges=yes

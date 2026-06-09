@@ -270,6 +270,69 @@ detector — it's a stopgap that keeps the box upright during volumetric
 floods while the detector still earns proper escalating bans for repeat
 offenders.
 
+### XDP fast-path drop (`enforcer.xdp`)
+
+iptables/ipset and the hashlimit pre-filter all run in netfilter, at the
+`INPUT` hook — which sits *after* two things that matter: the per-CPU NET_RX
+softirq has already allocated an `sk_buff`, and the AF_PACKET tap (the same one
+`pcap.OpenLive` uses for ingest) has already copied the packet. So a flood still
+pays the softirq cost even when every packet is destined for `DROP`, and the
+dropped packets still show up in `tcpdump`/`sngrep`.
+
+The optional **XDP enforcer** attaches an eBPF program at the NIC/driver layer
+(native XDP) or, where the driver lacks it, in `__netif_receive_skb_core`
+(generic XDP). Either way it runs *before* both the softirq sk_buff allocation
+and the AF_PACKET tap. A banned source's packets are returned `XDP_DROP` and
+simply cease to exist — no softirq, no userspace copy.
+
+**Composite, additive rollout.** XDP does not replace iptables; it joins it. A
+`CompositeEnforcer` fans every `Ban`/`Unban` out to both the existing
+iptables/ipset backend *and* the XDP map, so enabling it is purely additive and
+the proven path stays as a safety net. Only after the Phase 5 benchmark proves
+parity-or-better do you flip `standalone: true` and retire the per-IP iptables
+rules.
+
+**Safe by construction.** The program only ever returns `XDP_PASS` or
+`XDP_DROP` — no redirect, no packet mutation, no L4 dereference. It **fails
+open** everywhere: any source not in a ban map, any non-IP EtherType, any VLAN
+nesting past depth 2, any bounds-check miss, and any load/attach/preflight
+failure all leave traffic flowing (and the daemon on its iptables base). The
+v4 map is keyed by the four raw wire bytes of the source address and the Go
+side stores `ip.To4()` — the same bytes — so there is *zero* byte-order
+reasoning anywhere (the classic XDP endianness bug can't occur).
+
+**The whitelist can never enter the drop map.** Bans reach the enforcer from
+three producers — the decision engine, the manual ban API, and `restoreBans`
+at startup — and all three skip whitelisted IPs. On top of that, a startup
+(and periodic) **reconcile** deletes from the kernel map any entry that is not
+an active ban or is now whitelisted.
+
+**DB is authoritative; the map is reconciled to it.** The pinned kernel maps
+(under `/sys/fs/bpf/sipreaper`) are a *second* copy of ban state that survives
+restarts, but the SQLite store always wins: at every startup the daemon
+reconciles the map against `ListBans("active")` minus the whitelist before
+re-applying anything. A schema-version stamp guards against an incompatible
+pinned layout (the daemon unlinks and recreates rather than failing closed).
+`rm -rf /sys/fs/bpf/sipreaper` clears the kernel ban state but does **not**
+detach a running program — to *stop dropping* use `kill -HUP` is **not** it
+(HUP reloads config); use `POST /api/v1/xdp/detach` or `ip link set dev <iface>
+xdp off`.
+
+**Two behavioral changes you accept by turning it on:**
+
+1. **Detection blindness.** Because XDP drops before the AF_PACKET tap,
+   sipreaper's own detectors stop seeing a source once it's banned — so
+   recidivism/escalation counting can't re-trigger on an already-banned IP.
+   That's fine (it's already banned), but it is a semantic change. (An iptables
+   `INPUT` DROP has the same effect relative to the tap, so this isn't unique
+   to XDP.)
+2. **Mid-stream TCP/TLS teardown.** `XDP_DROP` on a banned source kills its
+   in-flight TCP/TLS (SIP-over-TLS, 5061) connections abruptly — identical to
+   an iptables DROP.
+
+See `docs/runbook-xdp.md` for enabling, verifying (`bpftool`/`xdpdump`/stats),
+the kill switch, and rollback.
+
 ### Dry-run / shadow mode
 
 A common reason fail2ban deployments end in tears is that someone tunes the
@@ -351,6 +414,18 @@ because libpcap handles and tailed file descriptors are bound at start.
   Should always be zero in steady state.
 - `sipreaper_detector_panics_total{component}` — bug indicator. Should
   always be zero.
+- `sipreaper_xdp_attached{mode}` — 1 while the XDP program is attached
+  (`mode=driver`/`generic`). **The critical silent-degradation signal:** if
+  `enforcer.xdp.enabled` is true but this is 0, XDP failed open to iptables.
+- `sipreaper_xdp_map_entries{family}` — live IP count in each ban map; alert
+  near the 1,048,576-entry cap.
+- `sipreaper_xdp_packets{result}` — cumulative `passed`/`dropped` packet counts
+  the kernel program maintains; `dropped` is the headline value-prop metric.
+- `sipreaper_xdp_reconcile_removed_total` — map entries evicted by reconcile
+  (stale or newly-whitelisted); surfaces DB↔map drift.
+
+`deploy/alerts.yml` ships Prometheus rules for these, led by
+`XdpSilentlyDegraded`.
 
 ### Hardening
 

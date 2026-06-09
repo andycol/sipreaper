@@ -101,6 +101,23 @@ enforcer:
     rate: 5                  # INVITEs / sec / source IP
     burst: 10
     ports: [5060, 5061]
+  # XDP kernel-fastpath drop. Banned IPs are dropped at the NIC/driver layer
+  # (XDP_DROP) before the netfilter INPUT path and before the AF_PACKET tap —
+  # eliminating the softirq cost a flood pays under iptables/ipset. Rollout is
+  # additive and fail-open: if XDP can't attach (unsupported NIC/kernel, no
+  # bpffs, another XDP prog present) the daemon logs a warning and stays on the
+  # `type` backend above. Requires kernel >= 5.7, bpffs at /sys/fs/bpf, and
+  # CAP_BPF + CAP_NET_ADMIN (see sipreaper.service). See docs/runbook-xdp.md.
+  xdp:
+    enabled: false
+    # NIC to attach to. Defaults to ingest.pcap.interface when empty.
+    interface: ""
+    # "" = auto (try native driver, fall back to generic/SKB) | native | generic
+    mode: ""
+    # When true, XDP is the ONLY backend (no per-IP iptables/ipset rules). Only
+    # flip this on AFTER the Phase 5 benchmark proves parity-or-better; rolling
+    # back to false + restart re-populates iptables from the active bans.
+    standalone: false
 
 # Notifications
 notifiers:

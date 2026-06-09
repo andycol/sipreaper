@@ -117,6 +117,37 @@ func TestGetActiveBanByIP(t *testing.T) {
 	}
 }
 
+func TestManualBansAreCurrentAndExpire(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	expires := now.Add(time.Hour)
+
+	_, err := s.CreateBan(models.BanEntry{
+		IP: "203.0.113.10", Detector: "manual", Reason: "operator",
+		Severity: "medium", BannedAt: now, Duration: time.Hour,
+		ExpiresAt: &expires, BanCount: 1, Status: "manual",
+	})
+	if err != nil {
+		t.Fatalf("CreateBan() error: %v", err)
+	}
+
+	current, err := s.ListEnforcedBans()
+	if err != nil {
+		t.Fatalf("ListEnforcedBans() error: %v", err)
+	}
+	if len(current) != 1 || current[0].Status != "manual" {
+		t.Fatalf("current bans = %+v, want one manual ban", current)
+	}
+
+	expired, err := s.GetExpiredBans()
+	if err != nil {
+		t.Fatalf("GetExpiredBans() error: %v", err)
+	}
+	if len(expired) != 1 || expired[0].IP != "203.0.113.10" {
+		t.Fatalf("expired bans = %+v, want manual ban", expired)
+	}
+}
+
 func TestBanCountByIP(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now().Truncate(time.Second)

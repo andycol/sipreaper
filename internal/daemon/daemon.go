@@ -15,6 +15,7 @@ import (
 
 	"github.com/andycol/sipreaper/internal/action"
 	"github.com/andycol/sipreaper/internal/api"
+	"github.com/andycol/sipreaper/internal/banner"
 	"github.com/andycol/sipreaper/internal/config"
 	"github.com/andycol/sipreaper/internal/decision"
 	"github.com/andycol/sipreaper/internal/detect"
@@ -31,12 +32,24 @@ type Daemon struct {
 	store     *store.Store
 	whitelist *whitelist.Whitelist
 	engine    *decision.Engine
-	enforcer  action.Enforcer
-	notifiers []action.Notifier
-	detectors []detect.Detector
-	events    chan models.SIPEvent
-	threats   chan models.Threat
-	startTime time.Time
+	// enfMu guards enforcer/xdp/base, which the kill-switch swaps at runtime
+	// while the action pipeline and maintenance goroutine read them.
+	enfMu    sync.RWMutex
+	enforcer action.Enforcer
+	// base is the iptables/ipset backend, always built so the XDP fail-open /
+	// kill-switch paths have something proven to revert to.
+	base action.Enforcer
+	// xdp is the concrete XDP enforcer handle, kept separately because the
+	// action.Enforcer interface has no Close()/diagnostics — the daemon needs
+	// the concrete type for reconcile, metrics, the kill switch and shutdown.
+	// nil whenever XDP is disabled or failed to attach (fail-open to base).
+	xdp                  *banner.XdpEnforcer
+	lastReconcileRemoved int
+	notifiers            []action.Notifier
+	detectors            []detect.Detector
+	events               chan models.SIPEvent
+	threats              chan models.Threat
+	startTime            time.Time
 }
 
 func Run(cfgPath string) error {
@@ -77,6 +90,10 @@ func Run(cfgPath string) error {
 	if cfg.Enforcer.DryRun {
 		log.Println("DRY RUN MODE: no firewall changes will be applied; bans recorded with status=dry_run")
 	}
+	token := os.Getenv(cfg.API.TokenEnv)
+	if token == "" {
+		return fmt.Errorf("api token env %s is not set; refusing to expose management API without authentication", cfg.API.TokenEnv)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -103,6 +120,19 @@ func Run(cfgPath string) error {
 		}
 	} else {
 		log.Println("log tailer: disabled")
+	}
+
+	var syslogIngest *ingest.SyslogIngest
+	if cfg.Ingest.Syslog.Enabled {
+		log.Printf("starting syslog ingest: listen=%s/udp", cfg.Ingest.Syslog.Listen)
+		syslogIngest = ingest.NewSyslogIngest(cfg.Ingest.Syslog.Listen, d.events)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			syslogIngest.Run()
+		}()
+	} else {
+		log.Println("syslog ingest: disabled")
 	}
 
 	var pcapCapture *ingest.PcapCapture
@@ -154,14 +184,30 @@ func Run(cfgPath string) error {
 		d.runBanExpiry(ctx, cfg.Bans.CheckInterval)
 	}()
 
+	// Reconcile the pinned XDP map against the DB (DB wins) BEFORE re-applying
+	// bans, so stale/whitelisted map entries from a previous run are evicted.
+	d.reconcileXdp()
+	d.refreshXdpMetrics()
+
 	// Restore active bans to enforcer
 	d.restoreBans()
 
+	// Periodic XDP metrics refresh + drift-healing reconcile.
+	if d.xdp != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.runXdpMaintenance(ctx)
+		}()
+	}
+
 	// Start API server
-	token := os.Getenv(cfg.API.TokenEnv)
 	srv := api.NewServer(s, token, cfg.API.Listen)
 	if logTailer != nil {
 		srv.SetLogTailerStats(func() (uint64, uint64) { return logTailer.Stats() })
+	}
+	if syslogIngest != nil {
+		srv.SetSyslogStats(func() (uint64, uint64) { return syslogIngest.Stats() })
 	}
 	srv.SetWhitelistGuard(wl.Contains)
 	srv.SetReloadWhitelistFunc(func() {
@@ -169,9 +215,22 @@ func Run(cfgPath string) error {
 			log.Printf("dynamic whitelist reload failed: %v", err)
 		}
 	})
-	if d.enforcer != nil {
-		srv.SetUnbanFunc(d.enforcer.Unban)
-	}
+	srv.SetBanFunc(func(ip net.IP, dur time.Duration, reason string) error {
+		if enf := d.currentEnforcer(); enf != nil {
+			return enf.Ban(ip, dur, reason)
+		}
+		return fmt.Errorf("no enforcer configured")
+	})
+	// Unban always routes through the *current* enforcer so the kill switch
+	// (which swaps it for the base) is honoured.
+	srv.SetUnbanFunc(func(ip net.IP) error {
+		if enf := d.currentEnforcer(); enf != nil {
+			return enf.Unban(ip)
+		}
+		return nil
+	})
+	srv.SetXdpStatusFunc(d.xdpStatusMap)
+	srv.SetXdpDetachFunc(d.detachXDP)
 	srv.SetHealthChecks(func() map[string]string {
 		out := map[string]string{}
 		if logTailer != nil {
@@ -185,8 +244,26 @@ func Run(cfgPath string) error {
 				out["log_tailer"] = "ok"
 			}
 		}
-		if d.enforcer != nil {
+		if syslogIngest != nil {
+			matched, _ := syslogIngest.Stats()
+			if matched == 0 && time.Since(d.startTime) > 5*time.Minute {
+				out["syslog_ingest"] = "no matches in last 5m"
+			} else {
+				out["syslog_ingest"] = "ok"
+			}
+		}
+		if d.currentEnforcer() != nil {
 			out["enforcer"] = "ok"
+		}
+		// XDP health: degrade-don't-fail. If configured-on but not attached,
+		// report it (silent fail-open to iptables is the dangerous case), but
+		// keep /healthz green-ish — the base enforcer is still protecting.
+		if d.cfg.Enforcer.XDP.Enabled {
+			if xe := d.currentXdp(); xe != nil && xe.Attached() {
+				out["xdp"] = "ok"
+			} else {
+				out["xdp"] = "degraded: enabled but not attached (on base enforcer)"
+			}
 		}
 		return out
 	})
@@ -249,8 +326,18 @@ func Run(cfgPath string) error {
 	if logTailer != nil {
 		logTailer.Stop()
 	}
+	if syslogIngest != nil {
+		syslogIngest.Stop()
+	}
 	if pcapCapture != nil {
 		pcapCapture.Stop()
+	}
+	if d.xdp != nil {
+		// Detach the link (program stops running); pinned maps survive so bans
+		// are restored on next start and reconciled against the DB.
+		if err := d.xdp.Close(); err != nil {
+			log.Printf("xdp close error: %v", err)
+		}
 	}
 	dedup.Stop()
 
@@ -304,22 +391,32 @@ func (d *Daemon) setupDetectors() {
 }
 
 func (d *Daemon) setupEnforcer() {
+	// Always build the proven iptables/ipset base, even when XDP is configured
+	// standalone, so fail-open has a real fallback to fall back TO.
+	var base action.Enforcer
 	switch d.cfg.Enforcer.Type {
 	case "ipset":
 		e := action.NewIPSetEnforcer(d.cfg.Enforcer.SetName, d.cfg.Enforcer.Chain)
 		if err := e.Init(); err != nil {
 			log.Printf("warning: ipset init failed: %v", err)
 		}
-		d.enforcer = e
+		base = e
 	case "iptables", "":
 		e := action.NewIPTablesEnforcer(d.cfg.Enforcer.Chain)
 		if err := e.Init(); err != nil {
 			log.Printf("warning: iptables init failed: %v", err)
 		}
-		d.enforcer = e
+		base = e
 	default:
 		log.Printf("warning: unknown enforcer type %q, falling back to iptables", d.cfg.Enforcer.Type)
-		d.enforcer = action.NewIPTablesEnforcer(d.cfg.Enforcer.Chain)
+		base = action.NewIPTablesEnforcer(d.cfg.Enforcer.Chain)
+	}
+
+	d.base = base
+	d.enforcer = base
+
+	if d.cfg.Enforcer.XDP.Enabled {
+		d.setupXDP(base)
 	}
 
 	if d.cfg.Enforcer.PreFilter.Enabled {
@@ -335,6 +432,183 @@ func (d *Daemon) setupEnforcer() {
 			log.Printf("prefilter active: %d INVITEs/sec/IP burst=%d ports=%v",
 				d.cfg.Enforcer.PreFilter.Rate, d.cfg.Enforcer.PreFilter.Burst, d.cfg.Enforcer.PreFilter.Ports)
 		}
+	}
+}
+
+// currentEnforcer returns the active enforcer under the read lock — the
+// kill-switch may swap it at runtime.
+func (d *Daemon) currentEnforcer() action.Enforcer {
+	d.enfMu.RLock()
+	defer d.enfMu.RUnlock()
+	return d.enforcer
+}
+
+// currentXdp returns the live XDP handle (nil if detached/disabled).
+func (d *Daemon) currentXdp() *banner.XdpEnforcer {
+	d.enfMu.RLock()
+	defer d.enfMu.RUnlock()
+	return d.xdp
+}
+
+// setupXDP attempts to layer the XDP enforcer on top of base. Every failure
+// path is fail-open: the daemon keeps `base` in d.enforcer and logs a warning,
+// exactly mirroring the iptables/ipset "log, don't be fatal" pattern.
+func (d *Daemon) setupXDP(base action.Enforcer) {
+	iface := d.cfg.Enforcer.XDP.Interface
+	if iface == "" {
+		iface = d.cfg.Ingest.Pcap.Interface
+	}
+
+	if reason := banner.Preflight(iface); reason != "" {
+		log.Printf("warning: xdp preflight failed (%s); staying on %s", reason, base.Name())
+		return
+	}
+	xe, err := banner.NewXdpEnforcer(iface, d.cfg.Enforcer.XDP.Mode)
+	if err != nil {
+		log.Printf("warning: xdp enforcer init failed, staying on %s: %v", base.Name(), err)
+		return
+	}
+	if err := xe.Init(); err != nil {
+		log.Printf("warning: xdp attach failed, staying on %s: %v", base.Name(), err)
+		return
+	}
+
+	d.xdp = xe
+	metrics.XdpAttached.WithLabelValues(xe.Mode()).Set(1)
+	log.Printf("enforcer: xdp attached on %s mode=%s", iface, xe.Mode())
+
+	if d.cfg.Enforcer.XDP.Standalone {
+		d.enforcer = xe
+	} else {
+		d.enforcer = action.NewCompositeEnforcer(base, xe)
+	}
+	log.Printf("enforcer: active = %s", d.enforcer.Name())
+}
+
+// reconcileXdp makes the pinned kernel map agree with the DB source-of-truth:
+// it removes any map entry that is not an active ban, or that is now
+// whitelisted. The DB always wins. Runs at startup (before restoreBans) and on
+// a low-frequency ticker so per-backend drift self-heals.
+func (d *Daemon) reconcileXdp() {
+	xe := d.currentXdp()
+	if xe == nil {
+		return
+	}
+	active, err := d.store.ListEnforcedBans()
+	if err != nil {
+		log.Printf("xdp reconcile: list bans failed: %v", err)
+		return
+	}
+	want := map[string]bool{}
+	for _, b := range active {
+		ip := net.ParseIP(b.IP)
+		if ip == nil || d.whitelist.Contains(ip) { // whitelist wins
+			continue
+		}
+		want[ip.String()] = true
+	}
+	have, err := xe.List()
+	if err != nil {
+		log.Printf("xdp reconcile: read map failed: %v", err)
+		return
+	}
+	removed := 0
+	for _, e := range have {
+		if want[e.IP] {
+			continue
+		}
+		if ip := net.ParseIP(e.IP); ip != nil {
+			_ = xe.Unban(ip)
+			removed++
+		}
+	}
+	metrics.XdpReconcileRemoved.Add(float64(removed))
+	d.lastReconcileRemoved = removed
+	if removed > 0 {
+		log.Printf("xdp reconcile: %d stale/whitelisted map entries removed", removed)
+	}
+	if v4, v6, merr := xe.MapEntries(); merr == nil {
+		metrics.XdpMapEntries.WithLabelValues("v4").Set(float64(v4))
+		metrics.XdpMapEntries.WithLabelValues("v6").Set(float64(v6))
+	}
+}
+
+// refreshXdpMetrics pulls the kernel stats/map sizes into Prometheus gauges.
+func (d *Daemon) refreshXdpMetrics() {
+	xe := d.currentXdp()
+	if xe == nil {
+		return
+	}
+	if passed, dropped, err := xe.Stats(); err == nil {
+		metrics.XdpPackets.WithLabelValues("passed").Set(float64(passed))
+		metrics.XdpPackets.WithLabelValues("dropped").Set(float64(dropped))
+	}
+	if v4, v6, err := xe.MapEntries(); err == nil {
+		metrics.XdpMapEntries.WithLabelValues("v4").Set(float64(v4))
+		metrics.XdpMapEntries.WithLabelValues("v6").Set(float64(v6))
+	}
+}
+
+// runXdpMaintenance periodically refreshes metrics and re-runs reconcile so
+// DB<->map drift self-heals well before the next restart.
+func (d *Daemon) runXdpMaintenance(ctx context.Context) {
+	if d.currentXdp() == nil {
+		return
+	}
+	metricsTick := time.NewTicker(15 * time.Second)
+	reconcileTick := time.NewTicker(5 * time.Minute)
+	defer metricsTick.Stop()
+	defer reconcileTick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-metricsTick.C:
+			d.refreshXdpMetrics()
+		case <-reconcileTick.C:
+			d.reconcileXdp()
+		}
+	}
+}
+
+// detachXDP is the no-restart kill switch: it detaches the program (pins/maps
+// survive) and reverts d.enforcer to the base backend. Safe to call when XDP
+// is already off. Re-attaching requires a daemon restart.
+func (d *Daemon) detachXDP() string {
+	d.enfMu.Lock()
+	defer d.enfMu.Unlock()
+	if d.xdp == nil {
+		return "xdp not attached"
+	}
+	if err := d.xdp.Close(); err != nil {
+		log.Printf("xdp detach: close error: %v", err)
+	}
+	d.xdp = nil
+	d.enforcer = d.base
+	metrics.XdpAttached.Reset()
+	msg := fmt.Sprintf("xdp detached; now on %s", d.base.Name())
+	log.Print(msg)
+	return msg
+}
+
+// xdpStatusMap is the GET /api/v1/xdp/status payload.
+func (d *Daemon) xdpStatusMap() map[string]interface{} {
+	xe := d.currentXdp()
+	if xe == nil {
+		return map[string]interface{}{"enabled": d.cfg.Enforcer.XDP.Enabled, "attached": false}
+	}
+	v4, v6, _ := xe.MapEntries()
+	passed, dropped, _ := xe.Stats()
+	return map[string]interface{}{
+		"enabled":                d.cfg.Enforcer.XDP.Enabled,
+		"attached":               xe.Attached(),
+		"mode":                   xe.Mode(),
+		"standalone":             d.cfg.Enforcer.XDP.Standalone,
+		"map_entries_v4":         v4,
+		"map_entries_v6":         v6,
+		"packets_passed":         passed,
+		"packets_dropped":        dropped,
+		"last_reconcile_removed": d.lastReconcileRemoved,
 	}
 }
 
@@ -427,8 +701,8 @@ func (d *Daemon) handleThreat(threat models.Threat) {
 		return
 	}
 
-	if d.enforcer != nil && !d.engine.DryRun() {
-		if err := d.enforcer.Ban(banAction.IP, banAction.Duration, banAction.Reason); err != nil {
+	if enf := d.currentEnforcer(); enf != nil && !d.engine.DryRun() {
+		if err := enf.Ban(banAction.IP, banAction.Duration, banAction.Reason); err != nil {
 			metrics.EnforcerErrors.WithLabelValues("ban").Inc()
 			log.Printf("enforcer error: %v", err)
 		}
@@ -482,8 +756,8 @@ func (d *Daemon) runBanExpiry(ctx context.Context, interval time.Duration) {
 				d.store.UpdateBanStatus(ban.ID, "expired")
 				// Dry-run entries never had a firewall rule installed, so
 				// skip the enforcer call (would error on non-existent rule).
-				if d.enforcer != nil && ban.Status != "dry_run" {
-					if err := d.enforcer.Unban(net.ParseIP(ban.IP)); err != nil {
+				if enf := d.currentEnforcer(); enf != nil && ban.Status != "dry_run" {
+					if err := enf.Unban(net.ParseIP(ban.IP)); err != nil {
 						metrics.EnforcerErrors.WithLabelValues("unban").Inc()
 					}
 				}
@@ -506,20 +780,30 @@ func (d *Daemon) runBanExpiry(ctx context.Context, interval time.Duration) {
 }
 
 func (d *Daemon) restoreBans() {
-	bans, err := d.store.ListBans("active")
+	bans, err := d.store.ListEnforcedBans()
 	if err != nil {
 		log.Printf("error restoring bans: %v", err)
 		return
 	}
+	restored := 0
 	for _, ban := range bans {
+		ip := net.ParseIP(ban.IP)
+		if ip == nil {
+			continue
+		}
+		// An IP banned-then-whitelisted while the daemon was down must never be
+		// re-applied to ANY backend. Mark the stale row expired and skip it.
+		if d.whitelist.Contains(ip) {
+			d.store.UpdateBanStatus(ban.ID, "expired")
+			log.Printf("restore: %s is now whitelisted; marking ban expired, not re-applying", ban.IP)
+			continue
+		}
 		if d.enforcer != nil {
-			ip := net.ParseIP(ban.IP)
-			if ip != nil {
-				d.enforcer.Ban(ip, ban.Duration, ban.Reason)
-			}
+			d.enforcer.Ban(ip, ban.Duration, ban.Reason)
+			restored++
 		}
 	}
-	if len(bans) > 0 {
-		log.Printf("restored %d active bans to enforcer", len(bans))
+	if restored > 0 {
+		log.Printf("restored %d active bans to enforcer", restored)
 	}
 }
