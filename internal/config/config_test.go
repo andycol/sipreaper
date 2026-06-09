@@ -148,6 +148,11 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 	}{
 		{"no ingest", func(c *Config) { c.Ingest.Log.Enabled = false; c.Ingest.Pcap.Enabled = false }},
 		{"log enabled no path", func(c *Config) { c.Ingest.Log.Path = "" }},
+		{"syslog enabled no listen", func(c *Config) {
+			c.Ingest.Log.Enabled = false
+			c.Ingest.Syslog.Enabled = true
+			c.Ingest.Syslog.Listen = ""
+		}},
 		{"unknown enforcer", func(c *Config) { c.Enforcer.Type = "wishful-thinking" }},
 		{"empty bans durations", func(c *Config) { c.Bans.Durations = nil }},
 		{"negative ban duration", func(c *Config) { c.Bans.Durations = []time.Duration{-1 * time.Minute} }},
@@ -176,9 +181,9 @@ func validBaseConfig() *Config {
 		Ingest: IngestConfig{
 			Log: LogIngestConfig{Enabled: true, Path: "/var/log/test.log", Format: "kamailio"},
 		},
-		Bans: BansConfig{Durations: []time.Duration{5 * time.Minute}, Cooldown: time.Hour, CheckInterval: 30 * time.Second},
+		Bans:     BansConfig{Durations: []time.Duration{5 * time.Minute}, Cooldown: time.Hour, CheckInterval: 30 * time.Second},
 		Enforcer: EnforcerConfig{Type: "iptables", Chain: "SIPREAPER"},
-		API:     APIConfig{Listen: "127.0.0.1:8080"},
-		Storage: StorageConfig{Path: "/tmp/test.db"},
+		API:      APIConfig{Listen: "127.0.0.1:8080"},
+		Storage:  StorageConfig{Path: "/tmp/test.db"},
 	}
 }

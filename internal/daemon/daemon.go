@@ -90,6 +90,10 @@ func Run(cfgPath string) error {
 	if cfg.Enforcer.DryRun {
 		log.Println("DRY RUN MODE: no firewall changes will be applied; bans recorded with status=dry_run")
 	}
+	token := os.Getenv(cfg.API.TokenEnv)
+	if token == "" {
+		return fmt.Errorf("api token env %s is not set; refusing to expose management API without authentication", cfg.API.TokenEnv)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -116,6 +120,19 @@ func Run(cfgPath string) error {
 		}
 	} else {
 		log.Println("log tailer: disabled")
+	}
+
+	var syslogIngest *ingest.SyslogIngest
+	if cfg.Ingest.Syslog.Enabled {
+		log.Printf("starting syslog ingest: listen=%s/udp", cfg.Ingest.Syslog.Listen)
+		syslogIngest = ingest.NewSyslogIngest(cfg.Ingest.Syslog.Listen, d.events)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			syslogIngest.Run()
+		}()
+	} else {
+		log.Println("syslog ingest: disabled")
 	}
 
 	var pcapCapture *ingest.PcapCapture
@@ -185,16 +202,24 @@ func Run(cfgPath string) error {
 	}
 
 	// Start API server
-	token := os.Getenv(cfg.API.TokenEnv)
 	srv := api.NewServer(s, token, cfg.API.Listen)
 	if logTailer != nil {
 		srv.SetLogTailerStats(func() (uint64, uint64) { return logTailer.Stats() })
+	}
+	if syslogIngest != nil {
+		srv.SetSyslogStats(func() (uint64, uint64) { return syslogIngest.Stats() })
 	}
 	srv.SetWhitelistGuard(wl.Contains)
 	srv.SetReloadWhitelistFunc(func() {
 		if err := wl.ReloadDynamic(); err != nil {
 			log.Printf("dynamic whitelist reload failed: %v", err)
 		}
+	})
+	srv.SetBanFunc(func(ip net.IP, dur time.Duration, reason string) error {
+		if enf := d.currentEnforcer(); enf != nil {
+			return enf.Ban(ip, dur, reason)
+		}
+		return fmt.Errorf("no enforcer configured")
 	})
 	// Unban always routes through the *current* enforcer so the kill switch
 	// (which swaps it for the base) is honoured.
@@ -217,6 +242,14 @@ func Run(cfgPath string) error {
 				out["log_tailer"] = "no matches in last 5m"
 			} else {
 				out["log_tailer"] = "ok"
+			}
+		}
+		if syslogIngest != nil {
+			matched, _ := syslogIngest.Stats()
+			if matched == 0 && time.Since(d.startTime) > 5*time.Minute {
+				out["syslog_ingest"] = "no matches in last 5m"
+			} else {
+				out["syslog_ingest"] = "ok"
 			}
 		}
 		if d.currentEnforcer() != nil {
@@ -292,6 +325,9 @@ func Run(cfgPath string) error {
 
 	if logTailer != nil {
 		logTailer.Stop()
+	}
+	if syslogIngest != nil {
+		syslogIngest.Stop()
 	}
 	if pcapCapture != nil {
 		pcapCapture.Stop()
@@ -458,7 +494,7 @@ func (d *Daemon) reconcileXdp() {
 	if xe == nil {
 		return
 	}
-	active, err := d.store.ListBans("active")
+	active, err := d.store.ListEnforcedBans()
 	if err != nil {
 		log.Printf("xdp reconcile: list bans failed: %v", err)
 		return
@@ -744,7 +780,7 @@ func (d *Daemon) runBanExpiry(ctx context.Context, interval time.Duration) {
 }
 
 func (d *Daemon) restoreBans() {
-	bans, err := d.store.ListBans("active")
+	bans, err := d.store.ListEnforcedBans()
 	if err != nil {
 		log.Printf("error restoring bans: %v", err)
 		return

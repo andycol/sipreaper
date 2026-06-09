@@ -282,6 +282,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("ingest.log.format %q: must be kamailio or opensips", c.Ingest.Log.Format)
 		}
 	}
+	if c.Ingest.Syslog.Enabled && c.Ingest.Syslog.Listen == "" {
+		return fmt.Errorf("ingest.syslog.listen is required when syslog ingest is enabled")
+	}
 
 	if c.Ingest.Pcap.Enabled {
 		if c.Ingest.Pcap.Interface == "" {

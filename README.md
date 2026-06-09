@@ -329,7 +329,7 @@ api:
 
 The API only listens on localhost by default. Change the listen address if you need remote access (and ensure you're behind a firewall or VPN).
 
-Token compares are constant-time. `/healthz` and `/metrics` are intentionally **unauthenticated** so monitoring probes and Prometheus scrape jobs don't need to hold the bearer token; everything else requires `Authorization: Bearer <token>`.
+Token compares are constant-time. The daemon refuses to start if the configured token environment variable is missing. `/healthz` and `/metrics` are intentionally **unauthenticated** so monitoring probes and Prometheus scrape jobs don't need to hold the bearer token; everything else requires `Authorization: Bearer <token>`.
 
 ### Storage
 
@@ -473,12 +473,12 @@ All `/api/v1/*` endpoints require `Authorization: Bearer <token>`. `/healthz` an
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/api/v1/status` | yes | Daemon health, uptime, active ban count |
-| `GET` | `/api/v1/bans` | yes | List bans. Query params: `status` (`active`/`expired`/`manual`/`dry_run`), `ip` |
-| `POST` | `/api/v1/bans` | yes | Manual ban. Body: `{"ip": "1.2.3.4", "duration": "1h"}`. Returns **409** if IP is whitelisted, **400** if invalid. |
-| `DELETE` | `/api/v1/bans/{ip}` | yes | Unban an IP |
+| `GET` | `/api/v1/bans` | yes | List bans. Defaults to `status=current` (`active` + `manual`). Query params: `status` (`current`/`active`/`expired`/`manual`/`dry_run`), `ip` |
+| `POST` | `/api/v1/bans` | yes | Manual ban. Body: `{"ip": "1.2.3.4", "duration": "1h"}`. Applies the firewall rule before returning success. Returns **409** if IP is whitelisted or already banned, **400** if invalid. |
+| `DELETE` | `/api/v1/bans/{ip}` | yes | Unban an IP from the active enforcer and mark its ban expired |
 | `GET` | `/api/v1/whitelist` | yes | List whitelist entries |
-| `POST` | `/api/v1/whitelist` | yes | Add to whitelist. Body: `{"ip": "10.0.0.0/8", "comment": "...", "clear_ban": false}`. Returns **409** if IP is currently banned (unless `clear_ban: true`); accepts both single IPs and CIDRs. |
-| `DELETE` | `/api/v1/whitelist/{ip}` | yes | Remove from whitelist (and reload running engine) |
+| `POST` | `/api/v1/whitelist` | yes | Add to whitelist. Body: `{"ip": "10.0.0.0/8", "comment": "...", "clear_ban": false}`. Returns **409** if the IP/CIDR overlaps current bans unless `clear_ban: true`; accepts both single IPs and CIDRs. |
+| `DELETE` | `/api/v1/whitelist/{ip-or-cidr}` | yes | Remove from whitelist (and reload running engine) |
 | `GET` | `/api/v1/events` | yes | Query events. Params: `ip`, `detector`, `last` (duration) |
 | `GET` | `/api/v1/stats` | yes | Detection stats, bans by detector, top offenders, log-tailer matched/unmatched counts |
 | `GET` | `/api/v1/xdp/status` | yes | XDP enforcer status: `attached`, `mode`, `map_entries_v4/v6`, `packets_passed/dropped`, `last_reconcile_removed` |

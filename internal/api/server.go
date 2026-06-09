@@ -19,8 +19,10 @@ type Server struct {
 	startTime       time.Time
 	httpSrv         *http.Server
 	logTailerStat   func() (matched, unmatched uint64)
+	syslogStat      func() (matched, unmatched uint64)
 	healthChecks    func() map[string]string
 	isWhitelisted   func(net.IP) bool
+	banFn           func(net.IP, time.Duration, string) error
 	unbanFn         func(net.IP) error
 	reloadWhitelist func()
 	xdpStatus       func() map[string]interface{}
@@ -50,7 +52,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/bans/{ip}", s.authMiddleware(s.handleDeleteBan))
 	mux.HandleFunc("GET /api/v1/whitelist", s.authMiddleware(s.handleListWhitelist))
 	mux.HandleFunc("POST /api/v1/whitelist", s.authMiddleware(s.handleAddWhitelist))
-	mux.HandleFunc("DELETE /api/v1/whitelist/{ip}", s.authMiddleware(s.handleRemoveWhitelist))
+	mux.HandleFunc("DELETE /api/v1/whitelist/{ip...}", s.authMiddleware(s.handleRemoveWhitelist))
 	mux.HandleFunc("GET /api/v1/events", s.authMiddleware(s.handleListEvents))
 	mux.HandleFunc("GET /api/v1/stats", s.authMiddleware(s.handleStats))
 	mux.HandleFunc("GET /api/v1/xdp/status", s.authMiddleware(s.handleXdpStatus))
@@ -84,6 +86,10 @@ func (s *Server) SetLogTailerStats(fn func() (matched, unmatched uint64)) {
 	s.logTailerStat = fn
 }
 
+func (s *Server) SetSyslogStats(fn func() (matched, unmatched uint64)) {
+	s.syslogStat = fn
+}
+
 // SetHealthChecks registers a function that returns subsystem statuses keyed
 // by subsystem name (e.g. "store" -> "ok", "log_tailer" -> "stalled"). Any
 // non-"ok" value flips /healthz to 503.
@@ -95,6 +101,12 @@ func (s *Server) SetHealthChecks(fn func() map[string]string) {
 // requests can be refused if the operator tried to ban a whitelisted IP.
 func (s *Server) SetWhitelistGuard(fn func(net.IP) bool) {
 	s.isWhitelisted = fn
+}
+
+// SetBanFunc wires the firewall enforcer's Ban so manual API bans have the
+// same network-layer effect as detector-driven bans.
+func (s *Server) SetBanFunc(fn func(net.IP, time.Duration, string) error) {
+	s.banFn = fn
 }
 
 // SetUnbanFunc wires the firewall enforcer's Unban so the whitelist endpoint

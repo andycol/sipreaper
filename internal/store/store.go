@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/andycol/sipreaper/internal/models"
@@ -107,11 +108,27 @@ func (s *Store) CreateBan(e models.BanEntry) (int64, error) {
 }
 
 func (s *Store) ListBans(status string) ([]models.BanEntry, error) {
+	return s.ListBansFiltered(status, "")
+}
+
+func (s *Store) ListBansFiltered(status, ip string) ([]models.BanEntry, error) {
 	query := `SELECT id, ip, detector, reason, severity, banned_at, duration, expires_at, ban_count, status FROM bans`
 	var args []interface{}
-	if status != "" {
-		query += ` WHERE status = ?`
+	var where []string
+	switch status {
+	case "":
+	case "current":
+		where = append(where, `status IN ('active','manual')`)
+	default:
+		where = append(where, `status = ?`)
 		args = append(args, status)
+	}
+	if ip != "" {
+		where = append(where, `ip = ?`)
+		args = append(args, ip)
+	}
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, ` AND `)
 	}
 	query += ` ORDER BY banned_at DESC`
 
@@ -122,6 +139,10 @@ func (s *Store) ListBans(status string) ([]models.BanEntry, error) {
 	defer rows.Close()
 
 	return scanBans(rows)
+}
+
+func (s *Store) ListEnforcedBans() ([]models.BanEntry, error) {
+	return s.ListBansFiltered("current", "")
 }
 
 func (s *Store) GetActiveBanByIP(ip string) (*models.BanEntry, error) {
@@ -170,7 +191,7 @@ func (s *Store) GetExpiredBans() ([]models.BanEntry, error) {
 	// would-be-ban record, masking the true rate during a tuning window.
 	rows, err := s.db.Query(
 		`SELECT id, ip, detector, reason, severity, banned_at, duration, expires_at, ban_count, status
-		 FROM bans WHERE status IN ('active','dry_run') AND expires_at IS NOT NULL AND expires_at <= ?`,
+		 FROM bans WHERE status IN ('active','manual','dry_run') AND expires_at IS NOT NULL AND expires_at <= ?`,
 		time.Now(),
 	)
 	if err != nil {
