@@ -52,7 +52,7 @@ type Daemon struct {
 	startTime            time.Time
 }
 
-func Run(cfgPath string) error {
+func Run(cfgPath, tokenOverride string) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -90,7 +90,10 @@ func Run(cfgPath string) error {
 	if cfg.Enforcer.DryRun {
 		log.Println("DRY RUN MODE: no firewall changes will be applied; bans recorded with status=dry_run")
 	}
-	token := os.Getenv(cfg.API.TokenEnv)
+	token := tokenOverride
+	if token == "" {
+		token = os.Getenv(cfg.API.TokenEnv)
+	}
 	if token == "" {
 		return fmt.Errorf("api token env %s is not set; refusing to expose management API without authentication", cfg.API.TokenEnv)
 	}
