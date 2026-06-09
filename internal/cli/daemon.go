@@ -10,7 +10,7 @@ func newDaemonCmd() *cobra.Command {
 		Use:   "daemon",
 		Short: "Start the SIPReaper daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return daemon.Run(configPath)
+			return daemon.Run(configPath, apiToken)
 		},
 	}
 }
