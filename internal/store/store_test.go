@@ -86,6 +86,40 @@ func TestUpdateBanStatus(t *testing.T) {
 	}
 }
 
+func TestListBansFilteredPageAndCount(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().Truncate(time.Second)
+
+	for i, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"} {
+		if _, err := s.CreateBan(models.BanEntry{
+			IP: ip, Detector: "scanner", Reason: "scan",
+			Severity: "medium", BannedAt: now.Add(time.Duration(i) * time.Minute),
+			Duration: 5 * time.Minute, BanCount: 1, Status: "active",
+		}); err != nil {
+			t.Fatalf("CreateBan(%s) error: %v", ip, err)
+		}
+	}
+
+	total, err := s.CountBansFiltered("current", "")
+	if err != nil {
+		t.Fatalf("CountBansFiltered() error: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3", total)
+	}
+
+	bans, err := s.ListBansFilteredPage("current", "", 2, 1)
+	if err != nil {
+		t.Fatalf("ListBansFilteredPage() error: %v", err)
+	}
+	if len(bans) != 2 {
+		t.Fatalf("len(bans) = %d, want 2", len(bans))
+	}
+	if bans[0].IP != "10.0.0.2" || bans[1].IP != "10.0.0.1" {
+		t.Fatalf("page IPs = %s,%s; want 10.0.0.2,10.0.0.1", bans[0].IP, bans[1].IP)
+	}
+}
+
 func TestGetActiveBanByIP(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now().Truncate(time.Second)

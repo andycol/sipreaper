@@ -71,11 +71,17 @@ func NewMaxMindResolver(dbPath string) (*MaxMindResolver, error) {
 }
 
 func (r *MaxMindResolver) Country(ip net.IP) (string, error) {
+	code, _, err := r.CountryInfo(ip)
+	return code, err
+}
+
+func (r *MaxMindResolver) CountryInfo(ip net.IP) (code, name string, err error) {
 	record, err := r.db.Country(ip)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return record.Country.IsoCode, nil
+	name = record.Country.Names["en"]
+	return record.Country.IsoCode, name, nil
 }
 
 func (r *MaxMindResolver) Close() error {

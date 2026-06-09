@@ -27,6 +27,7 @@ type Server struct {
 	reloadWhitelist func()
 	xdpStatus       func() map[string]interface{}
 	xdpDetach       func() string
+	countryLookup   func(net.IP) (code, name string, ok bool)
 }
 
 func NewServer(s *store.Store, token, listen string) *Server {
@@ -132,6 +133,10 @@ func (s *Server) SetXdpStatusFunc(fn func() map[string]interface{}) {
 // enforcer. Returns a human-readable status message.
 func (s *Server) SetXdpDetachFunc(fn func() string) {
 	s.xdpDetach = fn
+}
+
+func (s *Server) SetCountryLookupFunc(fn func(net.IP) (code, name string, ok bool)) {
+	s.countryLookup = fn
 }
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {

@@ -52,6 +52,12 @@ func keys(m map[string]interface{}) []string {
 
 func TestListBansJSONContract(t *testing.T) {
 	srv, s := newTestServer(t)
+	srv.SetCountryLookupFunc(func(ip net.IP) (string, string, bool) {
+		if ip.Equal(net.ParseIP("10.0.0.99")) {
+			return "GB", "United Kingdom", true
+		}
+		return "", "", false
+	})
 
 	expiresAt := time.Now().Add(1 * time.Hour)
 	s.CreateBan(models.BanEntry{
@@ -86,6 +92,7 @@ func TestListBansJSONContract(t *testing.T) {
 	requireKeys(t, "bans[0]", bans[0], []string{
 		"id", "ip", "detector", "reason", "severity",
 		"banned_at", "duration", "expires_at", "ban_count", "status",
+		"country_code", "country_name",
 	})
 
 	// Duration MUST be integer seconds, not Go's default nanoseconds.
@@ -105,6 +112,56 @@ func TestListBansJSONContract(t *testing.T) {
 	}
 	if got := bans[0]["ip"]; got != "10.0.0.99" {
 		t.Errorf("ip = %v, want 10.0.0.99", got)
+	}
+	if got := bans[0]["country_code"]; got != "GB" {
+		t.Errorf("country_code = %v, want GB", got)
+	}
+	if got := bans[0]["country_name"]; got != "United Kingdom" {
+		t.Errorf("country_name = %v, want United Kingdom", got)
+	}
+}
+
+func TestListBansPagedJSONContract(t *testing.T) {
+	srv, s := newTestServer(t)
+	now := time.Now()
+
+	for i, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"} {
+		s.CreateBan(models.BanEntry{
+			IP: ip, Detector: "scanner", Reason: "contract test",
+			Severity: "medium", BannedAt: now.Add(time.Duration(i) * time.Minute),
+			Duration: 1 * time.Hour, BanCount: 1, Status: "active",
+		})
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/bans?limit=2&offset=1", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	var page map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&page); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	requireKeys(t, "page", page, []string{"items", "total", "limit", "offset"})
+	if got := page["total"]; got != float64(3) {
+		t.Errorf("total = %v, want 3", got)
+	}
+	if got := page["limit"]; got != float64(2) {
+		t.Errorf("limit = %v, want 2", got)
+	}
+	if got := page["offset"]; got != float64(1) {
+		t.Errorf("offset = %v, want 1", got)
+	}
+	items, ok := page["items"].([]interface{})
+	if !ok {
+		t.Fatalf("items type = %T, want array", page["items"])
+	}
+	if len(items) != 2 {
+		t.Fatalf("len(items) = %d, want 2", len(items))
 	}
 }
 
