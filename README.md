@@ -342,11 +342,12 @@ Token compares are constant-time. The daemon refuses to start if the configured 
 ```yaml
 storage:
   path: "/var/lib/sipreaper/sipreaper.db"
+  event_retention: 168h
 ```
 
 SQLite is opened with WAL journal mode, `busy_timeout=5000`, `synchronous=NORMAL`, and a single-writer connection cap. This eliminates `database is locked` under bursty traffic.
 
-Stored data: bans (incl. `dry_run` records), event history, dynamic whitelist entries.
+Stored data: bans (incl. `dry_run` records), recent event evidence, dynamic whitelist entries. `event_retention` controls how long SIP event evidence is kept for drilldown/debugging; set it to `0s` to disable pruning.
 
 ### Logging
 
@@ -429,7 +430,7 @@ sipreaper status
 # View detection statistics (includes log_tailer matched/unmatched counts)
 sipreaper stats
 
-# Query recent events
+# Query recent stored event evidence
 sipreaper events --last 1h
 
 # Filter events by IP
@@ -485,7 +486,7 @@ All `/api/v1/*` endpoints require `Authorization: Bearer <token>`. `/healthz` an
 | `GET` | `/api/v1/whitelist` | yes | List whitelist entries |
 | `POST` | `/api/v1/whitelist` | yes | Add to whitelist. Body: `{"ip": "10.0.0.0/8", "comment": "...", "clear_ban": false}`. Returns **409** if the IP/CIDR overlaps current bans unless `clear_ban: true`; accepts both single IPs and CIDRs. |
 | `DELETE` | `/api/v1/whitelist/{ip-or-cidr}` | yes | Remove from whitelist (and reload running engine) |
-| `GET` | `/api/v1/events` | yes | Query events. Params: `ip`, `detector`, `last` (duration) |
+| `GET` | `/api/v1/events` | yes | Query stored event evidence. Params: `ip`, `detector`, `last` (duration) |
 | `GET` | `/api/v1/stats` | yes | Detection stats, bans by detector, top offenders, log-tailer matched/unmatched counts |
 | `GET` | `/api/v1/xdp/status` | yes | XDP enforcer status: `attached`, `mode`, `map_entries_v4/v6`, `packets_passed/dropped`, `last_reconcile_removed` |
 | `POST` | `/api/v1/xdp/detach` | yes | No-restart kill switch: detach XDP, revert to the base enforcer |

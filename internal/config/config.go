@@ -199,7 +199,8 @@ type APIConfig struct {
 }
 
 type StorageConfig struct {
-	Path string `mapstructure:"path"`
+	Path           string        `mapstructure:"path"`
+	EventRetention time.Duration `mapstructure:"event_retention"`
 }
 
 type LoggingConfig struct {
@@ -229,6 +230,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("bans.cooldown", "48h")
 	v.SetDefault("bans.check_interval", "30s")
 	v.SetDefault("storage.path", "/var/lib/sipreaper/sipreaper.db")
+	v.SetDefault("storage.event_retention", "168h")
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.output", "stdout")
 	v.SetDefault("ingest.log.format", "kamailio")
@@ -415,6 +417,9 @@ func (c *Config) Validate() error {
 
 	if c.Storage.Path == "" {
 		return fmt.Errorf("storage.path is required")
+	}
+	if c.Storage.EventRetention < 0 {
+		return fmt.Errorf("storage.event_retention must be >= 0")
 	}
 
 	return nil

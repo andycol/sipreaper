@@ -176,7 +176,9 @@ func TestRecordEvent(t *testing.T) {
 
 	evt := models.SIPEvent{
 		Timestamp: time.Now(), SourceIP: net.ParseIP("10.0.0.1"),
-		Method: "REGISTER", Source: "log",
+		Method: "REGISTER", Source: "log", UserAgent: "friendly-scanner",
+		FromUser: "100", ToUser: "200", CallID: "abc-123",
+		ResponseCode: 401, Rejected: true, RejectReason: "auth failed",
 	}
 	if err := s.RecordEvent(evt, "brute_force"); err != nil {
 		t.Fatalf("RecordEvent() error: %v", err)
@@ -188,6 +190,67 @@ func TestRecordEvent(t *testing.T) {
 	}
 	if len(events) != 1 {
 		t.Fatalf("events len = %d, want 1", len(events))
+	}
+	if got := events[0].UserAgent; got != "friendly-scanner" {
+		t.Errorf("user agent = %q, want friendly-scanner", got)
+	}
+	if got := events[0].FromUser; got != "100" {
+		t.Errorf("from user = %q, want 100", got)
+	}
+	if got := events[0].ToUser; got != "200" {
+		t.Errorf("to user = %q, want 200", got)
+	}
+	if got := events[0].CallID; got != "abc-123" {
+		t.Errorf("call id = %q, want abc-123", got)
+	}
+	if got := events[0].ResponseCode; got != 401 {
+		t.Errorf("response code = %d, want 401", got)
+	}
+	if got := events[0].Source; got != "log" {
+		t.Errorf("source = %q, want log", got)
+	}
+	if !events[0].Rejected {
+		t.Error("rejected = false, want true")
+	}
+	if got := events[0].RejectReason; got != "auth failed" {
+		t.Errorf("reject reason = %q, want auth failed", got)
+	}
+}
+
+func TestPruneEventsOlderThan(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+
+	oldEvent := models.SIPEvent{
+		Timestamp: now.Add(-48 * time.Hour), SourceIP: net.ParseIP("10.0.0.1"),
+		Method: "REGISTER", Source: "log",
+	}
+	newEvent := models.SIPEvent{
+		Timestamp: now, SourceIP: net.ParseIP("10.0.0.2"),
+		Method: "INVITE", Source: "pcap",
+	}
+
+	if err := s.RecordEvent(oldEvent, "scanner"); err != nil {
+		t.Fatalf("RecordEvent(old) error: %v", err)
+	}
+	if err := s.RecordEvent(newEvent, "scanner"); err != nil {
+		t.Fatalf("RecordEvent(new) error: %v", err)
+	}
+
+	deleted, err := s.PruneEventsOlderThan(now.Add(-24 * time.Hour))
+	if err != nil {
+		t.Fatalf("PruneEventsOlderThan() error: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+
+	events, err := s.ListEvents("", "", 0, 10)
+	if err != nil {
+		t.Fatalf("ListEvents() error: %v", err)
+	}
+	if len(events) != 1 || !events[0].SourceIP.Equal(net.ParseIP("10.0.0.2")) {
+		t.Fatalf("remaining events = %+v, want only 10.0.0.2", events)
 	}
 }
 

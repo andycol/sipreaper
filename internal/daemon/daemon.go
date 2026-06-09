@@ -648,6 +648,11 @@ func (d *Daemon) runDetectionPipeline(ctx context.Context, dedup *ingest.Dedup) 
 				method = "UNKNOWN"
 			}
 			metrics.EventsTotal.WithLabelValues(source, method).Inc()
+			if d.store != nil {
+				if err := d.store.RecordEvent(evt, ""); err != nil {
+					log.Printf("event store error: %v", err)
+				}
+			}
 
 			for _, det := range d.detectors {
 				d.safeDetect(det, evt)
@@ -777,6 +782,14 @@ func (d *Daemon) runBanExpiry(ctx context.Context, interval time.Duration) {
 				}
 
 				log.Printf("UNBANNED %s (expired)", ban.IP)
+			}
+			if d.cfg != nil && d.cfg.Storage.EventRetention > 0 {
+				deleted, err := d.store.PruneEventsOlderThan(time.Now().Add(-d.cfg.Storage.EventRetention))
+				if err != nil {
+					log.Printf("event retention prune error: %v", err)
+				} else if deleted > 0 {
+					log.Printf("event retention pruned %d old event(s)", deleted)
+				}
 			}
 		}
 	}

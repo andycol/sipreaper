@@ -54,6 +54,7 @@ api:
   token_env: "API_TOKEN"
 storage:
   path: "/tmp/test.db"
+  event_retention: 72h
 logging:
   level: "debug"
   output: "stdout"
@@ -105,6 +106,9 @@ logging:
 	if cfg.API.Listen != "127.0.0.1:9090" {
 		t.Errorf("api listen = %q, want 127.0.0.1:9090", cfg.API.Listen)
 	}
+	if cfg.Storage.EventRetention != 72*time.Hour {
+		t.Errorf("storage event_retention = %v, want 72h", cfg.Storage.EventRetention)
+	}
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -139,6 +143,9 @@ ingest:
 	if cfg.Storage.Path != "/var/lib/sipreaper/sipreaper.db" {
 		t.Errorf("default storage path = %q, want /var/lib/sipreaper/sipreaper.db", cfg.Storage.Path)
 	}
+	if cfg.Storage.EventRetention != 168*time.Hour {
+		t.Errorf("default storage event_retention = %v, want 168h", cfg.Storage.EventRetention)
+	}
 }
 
 func TestValidateRejectsBadConfigs(t *testing.T) {
@@ -157,6 +164,7 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"empty bans durations", func(c *Config) { c.Bans.Durations = nil }},
 		{"negative ban duration", func(c *Config) { c.Bans.Durations = []time.Duration{-1 * time.Minute} }},
 		{"empty api listen", func(c *Config) { c.API.Listen = "" }},
+		{"negative event retention", func(c *Config) { c.Storage.EventRetention = -1 * time.Hour }},
 		{"bad detector window", func(c *Config) {
 			c.Detectors.BruteForce.Enabled = true
 			c.Detectors.BruteForce.MaxAttempts = 5
