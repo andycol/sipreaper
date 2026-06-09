@@ -13,6 +13,8 @@ this is the do-X-when-Y reference.
   `RequiresMountsFor=/sys/fs/bpf`; mount manually with
   `sudo mount -t bpf bpf /sys/fs/bpf`).
 - Capabilities `CAP_BPF CAP_NET_ADMIN CAP_NET_RAW` (already in the unit).
+- A binary built with XDP support:
+  `make generate && make build-xdp`.
 
 Run `bench/phase0-hostcheck.sh <iface>` first to confirm all of the above and
 whether the NIC supports **native** vs only **generic** XDP.
@@ -106,15 +108,16 @@ bpftool map dump pinned /sys/fs/bpf/sipreaper/banned_v4 | grep -c 'key:'
 ```
 
 Fix: raise `MAX_BANS` in `internal/banner/bpf/xdp_ban.c`, bump `schemaVersion`
-in `enforcer_linux.go`, `make generate`, redeploy (the daemon unlinks the old
-pins on the schema bump). Or simply rely on the composite iptables backend.
+in `enforcer_linux.go`, run `make generate && make build-xdp`, redeploy (the
+daemon unlinks the old pins on the schema bump). Or simply rely on the
+composite iptables backend.
 
 ## Incident: after a kernel upgrade the program won't load
 
 The daemon logs `xdp load/attach failed` and **degrades to iptables
 automatically** (fail-open). To restore the fast path, regenerate the object on
-the new kernel: `make generate` (needs clang/LLVM + libbpf-dev +
-`linux-headers-$(uname -r)`), commit, redeploy.
+the new kernel and rebuild with XDP support: `make generate && make build-xdp`
+(needs clang/LLVM + libbpf-dev + `linux-headers-$(uname -r)`), redeploy.
 
 ## Incident: bans in the DB but not in the map (or vice versa)
 

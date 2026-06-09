@@ -73,28 +73,33 @@ make build
 ```
 
 This produces a `sipreaper` binary in the project root. The compiled XDP
-object is committed and embedded into the binary, so `make build` needs only
-the runtime toolchain above — **not** the eBPF toolchain.
+backend is intentionally excluded from the default binary, so `make build`
+needs only the runtime toolchain above — **not** the eBPF toolchain. This is
+the recommended build for normal OpenSIPS deployments using `iptables` or
+`ipset`.
 
-### Regenerating the XDP object (optional)
+### Building With XDP (optional)
 
-You only need this if you change `internal/banner/bpf/xdp_ban.c`. It requires
-clang/LLVM ≥ 11, libbpf headers and kernel headers, and runs only on Linux:
+You only need this if you want the optional kernel-fastpath XDP backend. It
+requires clang/LLVM ≥ 11, libbpf headers and kernel headers, and runs only on
+Linux:
 
 **Debian/Ubuntu:**
 ```bash
 sudo apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r) bpftool
-make generate   # re-emits internal/banner/bpf_bpf{el,eb}.{go,o}
+make generate
+make build-xdp
 ```
 
 **RHEL/CentOS/Rocky:**
 ```bash
 sudo yum install -y clang llvm libbpf-devel kernel-headers bpftool
 make generate
+make build-xdp
 ```
 
-Commit the regenerated `internal/banner/bpf_bpf*.{go,o}`. CI verifies the
-generated `.go` is reproducible (the `.o` is not byte-diffed — see `ci.yml`).
+The generated `internal/banner/bpf_bpf*.{go,o}` files are local build artifacts
+for XDP-enabled binaries.
 
 ### Run Tests
 
@@ -103,8 +108,8 @@ make test
 ```
 
 The XDP load/attach/classification tests (`internal/banner`) are Linux-only and
-skip automatically without root/BTF; run them privileged to exercise the kernel
-path: `sudo -E go test ./internal/banner/ -run TestClassification`.
+only compile in XDP builds; run them privileged to exercise the kernel path:
+`sudo -E go test -tags xdp ./internal/banner/ -run TestClassification`.
 
 ## Configuration
 
@@ -293,7 +298,7 @@ enforcer:
 - **`iptables`** (default): one `-j DROP` rule per banned IP, in a dedicated `SIPREAPER` chain linked from `INPUT`. Simple, universal. Linear lookup per packet — fine up to a few thousand bans.
 - **`ipset`**: a single `hash:net` set; one match-rule jumps to it. Lookup is O(1) regardless of ban count. Recommended for any production deployment that's likely to accumulate >1k bans. Requires the `ipset` binary on the host.
 
-- **`xdp`** (optional, layered via `enforcer.xdp.enabled`): an eBPF program at the NIC/driver layer that returns `XDP_DROP` for banned source IPs *before* netfilter and *before* the AF_PACKET tap, so a flood pays no softirq cost and dropped packets never reach `tcpdump`/userspace. Rollout is **additive** — a composite enforcer applies each ban to both the iptables/ipset backend AND the XDP map, with iptables as the safety net — and **fail-open**: any load/attach failure leaves the base backend in charge. Flip `standalone: true` only after the `bench/` benchmark proves parity. See [docs/runbook-xdp.md](docs/runbook-xdp.md). Two accepted behavioral changes: detection-blindness on already-banned IPs, and abrupt mid-stream TCP/TLS teardown — both documented in the runbook. Inspect at runtime via `GET /api/v1/xdp/status`; kill switch is `POST /api/v1/xdp/detach`.
+- **`xdp`** (optional, layered via `enforcer.xdp.enabled`, requires a binary built with `make build-xdp`): an eBPF program at the NIC/driver layer that returns `XDP_DROP` for banned source IPs *before* netfilter and *before* the AF_PACKET tap, so a flood pays no softirq cost and dropped packets never reach `tcpdump`/userspace. Rollout is **additive** — a composite enforcer applies each ban to both the iptables/ipset backend AND the XDP map, with iptables as the safety net — and **fail-open**: any load/attach failure leaves the base backend in charge. Flip `standalone: true` only after the `bench/` benchmark proves parity. See [docs/runbook-xdp.md](docs/runbook-xdp.md). Two accepted behavioral changes: detection-blindness on already-banned IPs, and abrupt mid-stream TCP/TLS teardown — both documented in the runbook. Inspect at runtime via `GET /api/v1/xdp/status`; kill switch is `POST /api/v1/xdp/detach`.
 
 Either backend can be paired with the **prefilter** (an iptables `-m hashlimit` rule installed at chain init that drops INVITEs above `rate` per source IP). Userspace detection still runs on whatever traffic isn't dropped, so repeat offenders still earn a proper escalating ban.
 
@@ -562,7 +567,7 @@ Place it in `/etc/sipreaper/env` (mode 600) so systemd picks it up. Use a differ
 - `CAP_NET_RAW` capability (for pcap) or run as root
 - `CAP_NET_ADMIN` capability (for iptables) or run as root
 - MaxMind GeoLite2-Country database (if geo_anomaly detector is enabled)
-- **For `enforcer.xdp` only:** kernel ≥ 5.7, kernel BTF, bpffs at `/sys/fs/bpf`, and `CAP_BPF` + `CAP_NET_ADMIN` (on kernels < 5.8, `CAP_SYS_ADMIN` + `CAP_SYS_RESOURCE` instead of `CAP_BPF`). The shipped `sipreaper.service` already declares these and `RequiresMountsFor=/sys/fs/bpf`; they're inert when XDP is disabled. Run `bench/phase0-hostcheck.sh <iface>` to verify support.
+- **For `enforcer.xdp` only:** build with `make generate && make build-xdp`; kernel ≥ 5.7, kernel BTF, bpffs at `/sys/fs/bpf`, and `CAP_BPF` + `CAP_NET_ADMIN` (on kernels < 5.8, `CAP_SYS_ADMIN` + `CAP_SYS_RESOURCE` instead of `CAP_BPF`). The shipped `sipreaper.service` already declares these and `RequiresMountsFor=/sys/fs/bpf`; they're inert when XDP is disabled. Run `bench/phase0-hostcheck.sh <iface>` to verify support.
 
 ### systemd Service
 

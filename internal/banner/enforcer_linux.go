@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && xdp
 
 // Package banner is sipreaper's XDP source-IP drop enforcer. It loads the
 // compiled xdp_ban program, attaches it to the SIP-facing NIC (native driver

@@ -9,10 +9,9 @@
 //	bpf_bpfel.go / bpf_bpfel.o   (little-endian: 386, amd64, arm, arm64, ...)
 //	bpf_bpfeb.go / bpf_bpfeb.o   (big-endian: s390x, mips, ...)
 //
-// -tags linux pins the generated files to GOOS=linux so a darwin checkout
-// (where the .o objects are absent and only enforcer_stub.go compiles) never
-// tries to //go:embed a missing object.
+// -tags "linux,xdp" pins the generated files to explicit XDP builds so normal
+// Linux installs do not need the eBPF toolchain or generated objects.
 
 package banner
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -type in6_key bpf bpf/xdp_ban.c -- -O2 -g -Wall -Werror -I/usr/include
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags "linux,xdp" -type in6_key bpf bpf/xdp_ban.c -- -O2 -g -Wall -Werror -I/usr/include
