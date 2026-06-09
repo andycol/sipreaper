@@ -25,7 +25,7 @@ jobs:
       - name: Install build + eBPF deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc libpcap-dev clang llvm libbpf-dev linux-headers-$(uname -r) bpftool
+          sudo apt-get install -y gcc libpcap-dev clang llvm libbpf-dev linux-headers-$(uname -r) linux-tools-common
       - name: Generate XDP bindings
         run: make generate
       - run: go build ./...
@@ -48,7 +48,7 @@ jobs:
       - name: Install eBPF toolchain (pinned)
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-14 llvm-14 libbpf-dev linux-headers-$(uname -r) bpftool gcc libpcap-dev
+          sudo apt-get install -y clang-14 llvm-14 libbpf-dev linux-headers-$(uname -r) linux-tools-common gcc libpcap-dev
           sudo ln -sf /usr/bin/clang-14 /usr/local/bin/clang
           sudo ln -sf /usr/bin/llvm-strip-14 /usr/local/bin/llvm-strip
       - run: make generate
@@ -71,7 +71,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc libpcap-dev clang llvm libbpf-dev linux-headers-$(uname -r) bpftool
+          sudo apt-get install -y gcc libpcap-dev clang llvm libbpf-dev linux-headers-$(uname -r) linux-tools-common
       - name: Generate XDP bindings
         run: make generate
       - name: Run privileged banner tests (load + attach + PROG_TEST_RUN)

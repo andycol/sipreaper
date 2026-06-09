@@ -248,15 +248,26 @@ func (s *Store) ListEvents(ip, detector string, since time.Duration, limit int) 
 	return events, rows.Err()
 }
 
-func (s *Store) AddWhitelist(ipCIDR, comment, source string) (int64, error) {
+func (s *Store) AddWhitelist(ipCIDR, comment, source string) (models.WhitelistEntry, error) {
+	createdAt := time.Now()
 	res, err := s.db.Exec(
 		`INSERT INTO whitelist (ip_cidr, comment, source, created_at) VALUES (?, ?, ?, ?)`,
-		ipCIDR, comment, source, time.Now(),
+		ipCIDR, comment, source, createdAt,
 	)
 	if err != nil {
-		return 0, err
+		return models.WhitelistEntry{}, err
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return models.WhitelistEntry{}, err
+	}
+	return models.WhitelistEntry{
+		ID:        id,
+		IPCIDR:    ipCIDR,
+		Comment:   comment,
+		Source:    source,
+		CreatedAt: createdAt,
+	}, nil
 }
 
 func (s *Store) RemoveWhitelist(ipCIDR string) error {

@@ -209,7 +209,7 @@ func (s *Server) handleAddWhitelist(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	id, err := s.store.AddWhitelist(req.IP, req.Comment, "dynamic")
+	entry, err := s.store.AddWhitelist(req.IP, req.Comment, "dynamic")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -219,7 +219,7 @@ func (s *Server) handleAddWhitelist(w http.ResponseWriter, r *http.Request) {
 		s.reloadWhitelist()
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]interface{}{"id": id, "ip": req.IP})
+	writeJSON(w, http.StatusCreated, entry)
 }
 
 func (s *Server) handleRemoveWhitelist(w http.ResponseWriter, r *http.Request) {

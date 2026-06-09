@@ -2,7 +2,7 @@
 //
 // These tests pin the *external* JSON shape returned by the HTTP API,
 // not just round-tripping through Go's typed structs. The README and
-// downstream consumers (the Phonovo SuperAdmin UI in particular) expect
+// downstream admin UIs expect
 // snake_case keys and integer-second durations. Without explicit JSON
 // tags on the model structs Go's encoding/json silently emits
 // PascalCase field names — see the Go type definitions in
@@ -178,6 +178,43 @@ func TestListWhitelistJSONContract(t *testing.T) {
 		t.Errorf("ip_cidr = %v, want 10.0.0.0/8", got)
 	}
 	if got := entries[0]["source"]; got != "dynamic" {
+		t.Errorf("source = %v, want dynamic", got)
+	}
+}
+
+// ---------------------------------------------------------------------
+// POST /api/v1/whitelist
+// ---------------------------------------------------------------------
+
+func TestCreateWhitelistJSONContract(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	body := `{"ip": "10.0.0.0/8", "comment": "contract test"}`
+	req := httptest.NewRequest("POST", "/api/v1/whitelist", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
+	}
+
+	var entry map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&entry); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	requireKeys(t, "whitelist create", entry, []string{
+		"id", "ip_cidr", "comment", "source", "created_at",
+	})
+	if got := entry["ip_cidr"]; got != "10.0.0.0/8" {
+		t.Errorf("ip_cidr = %v, want 10.0.0.0/8", got)
+	}
+	if got := entry["comment"]; got != "contract test" {
+		t.Errorf("comment = %v, want contract test", got)
+	}
+	if got := entry["source"]; got != "dynamic" {
 		t.Errorf("source = %v, want dynamic", got)
 	}
 }
