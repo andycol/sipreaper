@@ -1,10 +1,9 @@
-//go:build !linux
+//go:build !linux || !xdp
 
-// Package banner's non-Linux stub. XDP is a Linux-kernel facility, so on
-// darwin (developer machines) and any other GOOS the enforcer is inert: every
-// constructor/preflight reports unavailability and the daemon stays on its
-// iptables/ipset base enforcer. This file exists so the whole module — daemon,
-// CLI, tests — still compiles and runs cross-platform.
+// Package banner's stub keeps the default build free of generated eBPF
+// bindings. XDP is available only in Linux builds compiled with -tags xdp; all
+// other builds report unavailability and the daemon stays on its iptables/ipset
+// base enforcer.
 package banner
 
 import (
@@ -15,7 +14,7 @@ import (
 	"github.com/andycol/sipreaper/internal/action"
 )
 
-var errUnsupported = errors.New("xdp enforcer requires linux")
+var errUnsupported = errors.New("xdp enforcer requires linux and a binary built with -tags xdp")
 
 // XdpEnforcer is the stub type. It satisfies action.Enforcer so the daemon can
 // hold a concrete *XdpEnforcer handle uniformly across platforms.
@@ -23,11 +22,12 @@ type XdpEnforcer struct{}
 
 var _ action.Enforcer = (*XdpEnforcer)(nil)
 
-// Preflight always reports XDP unavailable off Linux.
-func Preflight(iface string) string { return "xdp requires linux" }
+// Preflight reports XDP unavailable when this binary was not built with XDP
+// support.
+func Preflight(iface string) string { return errUnsupported.Error() }
 
-// NewXdpEnforcer always fails off Linux; the daemon falls open to its base
-// enforcer.
+// NewXdpEnforcer always fails without XDP build support; the daemon falls open
+// to its base enforcer.
 func NewXdpEnforcer(iface, mode string) (*XdpEnforcer, error) { return nil, errUnsupported }
 
 func (e *XdpEnforcer) Name() string                                     { return "xdp" }
