@@ -32,6 +32,11 @@ func (e *IPTablesEnforcer) Init() error {
 }
 
 func (e *IPTablesEnforcer) Ban(ip net.IP, duration time.Duration, reason string) error {
+	checkArgs := e.checkArgs(ip)
+	if err := exec.Command("iptables", checkArgs...).Run(); err == nil {
+		return nil
+	}
+
 	args := e.banArgs(ip)
 	if err := exec.Command("iptables", args...).Run(); err != nil {
 		return fmt.Errorf("iptables ban %s: %w", ip, err)
@@ -40,11 +45,21 @@ func (e *IPTablesEnforcer) Ban(ip net.IP, duration time.Duration, reason string)
 }
 
 func (e *IPTablesEnforcer) Unban(ip net.IP) error {
-	args := e.unbanArgs(ip)
-	if err := exec.Command("iptables", args...).Run(); err != nil {
-		return fmt.Errorf("iptables unban %s: %w", ip, err)
+	checkArgs := e.checkArgs(ip)
+	for removed := 0; removed < 10000; removed++ {
+		if err := exec.Command("iptables", checkArgs...).Run(); err != nil {
+			return nil
+		}
+
+		args := e.unbanArgs(ip)
+		if err := exec.Command("iptables", args...).Run(); err != nil {
+			if checkErr := exec.Command("iptables", checkArgs...).Run(); checkErr != nil {
+				return nil
+			}
+			return fmt.Errorf("iptables unban %s: %w", ip, err)
+		}
 	}
-	return nil
+	return fmt.Errorf("iptables unban %s: exceeded duplicate removal limit", ip)
 }
 
 func (e *IPTablesEnforcer) List() ([]BanEntry, error) {
@@ -65,6 +80,10 @@ func (e *IPTablesEnforcer) List() ([]BanEntry, error) {
 
 func (e *IPTablesEnforcer) banArgs(ip net.IP) []string {
 	return []string{"-A", e.chain, "-s", ip.String(), "-j", "DROP"}
+}
+
+func (e *IPTablesEnforcer) checkArgs(ip net.IP) []string {
+	return []string{"-C", e.chain, "-s", ip.String(), "-j", "DROP"}
 }
 
 func (e *IPTablesEnforcer) unbanArgs(ip net.IP) []string {

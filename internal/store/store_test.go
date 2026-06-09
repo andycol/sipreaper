@@ -194,12 +194,15 @@ func TestRecordEvent(t *testing.T) {
 func TestWhitelistCRUD(t *testing.T) {
 	s := newTestStore(t)
 
-	id, err := s.AddWhitelist("10.0.0.0/8", "internal", "dynamic")
+	entry, err := s.AddWhitelist("10.0.0.0/8", "internal", "dynamic")
 	if err != nil {
 		t.Fatalf("AddWhitelist() error: %v", err)
 	}
-	if id == 0 {
+	if entry.ID == 0 {
 		t.Error("expected non-zero id")
+	}
+	if entry.IPCIDR != "10.0.0.0/8" || entry.Comment != "internal" || entry.Source != "dynamic" {
+		t.Fatalf("AddWhitelist() entry = %+v, want stored whitelist entry", entry)
 	}
 
 	entries, err := s.ListWhitelist()
