@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net"
 	"strings"
@@ -202,15 +203,19 @@ func (s *Store) GetExpiredBans() ([]models.BanEntry, error) {
 }
 
 func (s *Store) RecordEvent(evt models.SIPEvent, detector string) error {
-	_, err := s.db.Exec(
+	raw, err := json.Marshal(evt)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
 		`INSERT INTO events (ip, method, detector, timestamp, raw_data) VALUES (?, ?, ?, ?, ?)`,
-		evt.SourceIP.String(), evt.Method, detector, evt.Timestamp, "",
+		evt.SourceIP.String(), evt.Method, detector, evt.Timestamp, string(raw),
 	)
 	return err
 }
 
 func (s *Store) ListEvents(ip, detector string, since time.Duration, limit int) ([]models.SIPEvent, error) {
-	query := `SELECT ip, method, detector, timestamp FROM events WHERE 1=1`
+	query := `SELECT ip, method, detector, timestamp, raw_data FROM events WHERE 1=1`
 	var args []interface{}
 
 	if ip != "" {
@@ -239,13 +244,31 @@ func (s *Store) ListEvents(ip, detector string, since time.Duration, limit int) 
 	for rows.Next() {
 		var e models.SIPEvent
 		var ipStr, det string
-		if err := rows.Scan(&ipStr, &e.Method, &det, &e.Timestamp); err != nil {
+		var raw sql.NullString
+		if err := rows.Scan(&ipStr, &e.Method, &det, &e.Timestamp, &raw); err != nil {
 			return nil, err
 		}
 		e.SourceIP = net.ParseIP(ipStr)
+		if raw.Valid && raw.String != "" {
+			var stored models.SIPEvent
+			if err := json.Unmarshal([]byte(raw.String), &stored); err == nil {
+				e = stored
+				if e.SourceIP == nil {
+					e.SourceIP = net.ParseIP(ipStr)
+				}
+			}
+		}
 		events = append(events, e)
 	}
 	return events, rows.Err()
+}
+
+func (s *Store) PruneEventsOlderThan(cutoff time.Time) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM events WHERE timestamp < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (s *Store) AddWhitelist(ipCIDR, comment, source string) (models.WhitelistEntry, error) {

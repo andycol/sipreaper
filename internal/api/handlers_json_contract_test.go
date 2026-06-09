@@ -272,4 +272,28 @@ func TestListEventsJSONContract(t *testing.T) {
 	if got := events[0]["source_ip"]; got != "10.0.0.42" {
 		t.Errorf("source_ip = %v, want 10.0.0.42", got)
 	}
+	if got := events[0]["user_agent"]; got != "friendly-scanner" {
+		t.Errorf("user_agent = %v, want friendly-scanner", got)
+	}
+	if got := events[0]["from_user"]; got != "100" {
+		t.Errorf("from_user = %v, want 100", got)
+	}
+	if got := events[0]["to_user"]; got != "200" {
+		t.Errorf("to_user = %v, want 200", got)
+	}
+	if got := events[0]["call_id"]; got != "abc-123" {
+		t.Errorf("call_id = %v, want abc-123", got)
+	}
+	if got := events[0]["response_code"]; got != float64(401) {
+		t.Errorf("response_code = %v, want 401", got)
+	}
+	if got := events[0]["source"]; got != "log" {
+		t.Errorf("source = %v, want log", got)
+	}
+	if got := events[0]["rejected"]; got != true {
+		t.Errorf("rejected = %v, want true", got)
+	}
+	if got := events[0]["reject_reason"]; got != "auth failed" {
+		t.Errorf("reject_reason = %v, want auth failed", got)
+	}
 }
