@@ -18,8 +18,10 @@ type FailedCallRatio struct {
 	minRatio float64
 	window   time.Duration
 
-	mu   sync.Mutex
-	data map[string]*ratioBucket
+	mu        sync.Mutex
+	data      map[string]*ratioBucket
+	lastSweep time.Time
+	now       func() time.Time // replaced in tests
 }
 
 type ratioBucket struct {
@@ -42,10 +44,12 @@ func NewFailedCallRatio(minCalls int, minRatio float64, window time.Duration) *F
 		window = 5 * time.Minute
 	}
 	return &FailedCallRatio{
-		minCalls: minCalls,
-		minRatio: minRatio,
-		window:   window,
-		data:     make(map[string]*ratioBucket),
+		minCalls:  minCalls,
+		minRatio:  minRatio,
+		window:    window,
+		data:      make(map[string]*ratioBucket),
+		lastSweep: time.Now(),
+		now:       time.Now,
 	}
 }
 
@@ -58,12 +62,23 @@ func (d *FailedCallRatio) Detect(event models.SIPEvent) *models.Threat {
 
 	failed := event.Rejected || (event.ResponseCode >= 400 && event.ResponseCode < 600)
 
-	now := time.Now()
-	cutoff := now.Add(-d.window)
 	ip := event.SourceIP.String()
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	now := d.now()
+	cutoff := now.Add(-d.window)
+
+	// Forget IPs that have gone quiet, at most once per window.
+	if now.Sub(d.lastSweep) >= d.window {
+		for k, b := range d.data {
+			if n := len(b.events); n == 0 || !b.events[n-1].t.After(cutoff) {
+				delete(d.data, k)
+			}
+		}
+		d.lastSweep = now
+	}
 
 	b, ok := d.data[ip]
 	if !ok {
@@ -78,6 +93,9 @@ func (d *FailedCallRatio) Detect(event models.SIPEvent) *models.Threat {
 		if e.t.After(cutoff) {
 			kept = append(kept, e)
 		}
+	}
+	if over := len(kept) - maxEntriesPerIP; over > 0 {
+		kept = kept[:copy(kept, kept[over:])]
 	}
 	b.events = kept
 

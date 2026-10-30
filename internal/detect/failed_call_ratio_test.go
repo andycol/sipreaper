@@ -1,6 +1,7 @@
 package detect
 
 import (
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -76,5 +77,24 @@ func TestFailedCallRatioIgnoresNonInvite(t *testing.T) {
 		if threat := d.Detect(evt); threat != nil {
 			t.Fatal("non-INVITE should not affect failed call ratio")
 		}
+	}
+}
+
+func TestFailedCallRatioForgetsQuietIPs(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	d := NewFailedCallRatio(20, 0.8, time.Minute)
+	d.now = clock.now
+
+	for i := 0; i < 300; i++ {
+		d.Detect(models.SIPEvent{SourceIP: net.ParseIP(fmt.Sprintf("198.51.100.%d", i%250)), Method: "INVITE"})
+	}
+	clock.advance(2 * time.Minute)
+	d.Detect(models.SIPEvent{SourceIP: net.ParseIP("10.0.0.1"), Method: "INVITE"})
+
+	d.mu.Lock()
+	n := len(d.data)
+	d.mu.Unlock()
+	if n != 1 {
+		t.Errorf("ips held = %d, want 1 after quiet IPs swept", n)
 	}
 }

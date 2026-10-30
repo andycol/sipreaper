@@ -12,15 +12,20 @@ type SIPMessage struct {
 	IsResponse   bool
 	Method       string
 	ResponseCode int
+	Reason       string // response reason phrase, e.g. "Forbidden"
 	CallID       string
 	UserAgent    string
 	FromUser     string
 	ToUser       string
+	// HasAuth is true when the request carries digest credentials
+	// (Authorization / Proxy-Authorization). A 401/407 answering a request
+	// WITHOUT credentials is just the normal digest challenge.
+	HasAuth bool
 }
 
 var (
 	requestLineRe  = regexp.MustCompile(`^(\w+)\s+sip:`)
-	responseLineRe = regexp.MustCompile(`^SIP/2\.0\s+(\d+)`)
+	responseLineRe = regexp.MustCompile(`^SIP/2\.0\s+(\d+)\s*(.*)$`)
 	cseqMethodRe   = regexp.MustCompile(`(?i)^CSeq:\s*\d+\s+(\w+)`)
 	userRe         = regexp.MustCompile(`sip:([^@]+)@`)
 )
@@ -43,6 +48,7 @@ func ParseSIPMessage(data []byte) (*SIPMessage, error) {
 		msg.IsResponse = true
 		code, _ := strconv.Atoi(m[1])
 		msg.ResponseCode = code
+		msg.Reason = strings.TrimSpace(m[2])
 	} else if m := requestLineRe.FindStringSubmatch(firstLine); m != nil {
 		msg.Method = m[1]
 	} else {
@@ -59,6 +65,8 @@ func ParseSIPMessage(data []byte) (*SIPMessage, error) {
 
 		if strings.HasPrefix(lower, "call-id:") || strings.HasPrefix(lower, "i:") {
 			msg.CallID = strings.TrimSpace(line[strings.IndexByte(line, ':')+1:])
+		} else if strings.HasPrefix(lower, "authorization:") || strings.HasPrefix(lower, "proxy-authorization:") {
+			msg.HasAuth = true
 		} else if strings.HasPrefix(lower, "user-agent:") {
 			msg.UserAgent = strings.TrimSpace(line[strings.IndexByte(line, ':')+1:])
 		} else if strings.HasPrefix(lower, "from:") || strings.HasPrefix(lower, "f:") {

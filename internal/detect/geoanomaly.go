@@ -33,6 +33,11 @@ func NewGeoAnomaly(allowedCountries []string, resolver GeoResolver) *GeoAnomaly 
 func (d *GeoAnomaly) Name() string { return "geo_anomaly" }
 
 func (d *GeoAnomaly) Detect(event models.SIPEvent) *models.Threat {
+	// Counts requests; response events would count each call several times.
+	if event.IsResponse {
+		return nil
+	}
+
 	if len(d.allowed) == 0 || d.resolver == nil {
 		return nil
 	}

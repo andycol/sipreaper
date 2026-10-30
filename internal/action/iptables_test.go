@@ -122,12 +122,19 @@ func installFakeIPTables(t *testing.T, script string) (logPath string, statePath
 	binPath := filepath.Join(dir, "iptables")
 	logPath = filepath.Join(dir, "iptables.log")
 	statePath = filepath.Join(dir, "iptables.state")
+	// Every call carries "-w 10" (wait for the xtables lock). Record the raw
+	// args, then strip the flag so scripts can match on "$1".
+	shebang, body, _ := strings.Cut(script, "\n")
+	script = shebang + "\n" +
+		`echo "$@" >> "$IPTABLES_RAW_LOG"` + "\n" +
+		`if [ "$1" = "-w" ]; then shift 2; fi` + "\n" + body
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("IPTABLES_LOG", logPath)
 	t.Setenv("IPTABLES_STATE", statePath)
+	t.Setenv("IPTABLES_RAW_LOG", filepath.Join(dir, "iptables.raw.log"))
 	return logPath, statePath
 }
 
@@ -142,4 +149,20 @@ func readCommandLog(t *testing.T, path string) []string {
 		return nil
 	}
 	return out
+}
+
+func TestIPTablesWaitsForXtablesLock(t *testing.T) {
+	_, _ = installFakeIPTables(t, `#!/bin/sh
+if [ "$1" = "-C" ]; then exit 1; fi
+exit 0
+`)
+	e := &IPTablesEnforcer{chain: "SIPREAPER"}
+	if err := e.Ban(net.ParseIP("10.0.0.1"), 0, "test"); err != nil {
+		t.Fatalf("Ban() error: %v", err)
+	}
+	for _, line := range readCommandLog(t, os.Getenv("IPTABLES_RAW_LOG")) {
+		if !strings.HasPrefix(line, "-w 10 ") {
+			t.Errorf("iptables called without -w: %q", line)
+		}
+	}
 }

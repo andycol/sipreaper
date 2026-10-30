@@ -2,7 +2,6 @@ package action
 
 import (
 	"fmt"
-	"os/exec"
 	"strconv"
 )
 
@@ -58,10 +57,10 @@ func (p *PreFilter) Apply() error {
 
 		// Idempotent install: -C with the same args, skip if it exists.
 		check := append([]string{"-C", p.chain}, args[2:]...)
-		if err := exec.Command("iptables", check...).Run(); err == nil {
+		if err := iptablesCmd(check...).Run(); err == nil {
 			continue
 		}
-		if err := exec.Command("iptables", args...).Run(); err != nil {
+		if err := iptablesCmd(args...).Run(); err != nil {
 			return fmt.Errorf("installing prefilter rule on port %d: %w", port, err)
 		}
 	}

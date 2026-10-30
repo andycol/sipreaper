@@ -91,3 +91,41 @@ func TestParseSIPFromUser(t *testing.T) {
 		}
 	}
 }
+
+func TestParseSIPRequestHasAuth(t *testing.T) {
+	base := "REGISTER sip:example.com SIP/2.0\r\n" +
+		"Call-ID: c1\r\n" +
+		"CSeq: 2 REGISTER\r\n"
+	for _, hdr := range []string{
+		"Authorization: Digest username=\"alice\", realm=\"x\"\r\n",
+		"Proxy-Authorization: Digest username=\"alice\"\r\n",
+		"authorization: Digest username=\"alice\"\r\n",
+	} {
+		msg, err := ParseSIPMessage([]byte(base + hdr + "\r\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !msg.HasAuth {
+			t.Errorf("HasAuth = false for header %q", hdr)
+		}
+	}
+
+	msg, err := ParseSIPMessage([]byte(base + "\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.HasAuth {
+		t.Error("HasAuth = true for request without credentials")
+	}
+}
+
+func TestParseSIPResponseReason(t *testing.T) {
+	raw := "SIP/2.0 403 Registration Required\r\nCall-ID: c1\r\nCSeq: 1 INVITE\r\n\r\n"
+	msg, err := ParseSIPMessage([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.ResponseCode != 403 || msg.Reason != "Registration Required" {
+		t.Errorf("got code=%d reason=%q", msg.ResponseCode, msg.Reason)
+	}
+}

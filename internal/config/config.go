@@ -42,6 +42,12 @@ type PcapIngestConfig struct {
 	Interface string `mapstructure:"interface"`
 	Ports     []int  `mapstructure:"ports"`
 	BPFFilter string `mapstructure:"bpf_filter"`
+	// RejectResponses lists the responses that mean "the SIP server refused
+	// this source" (→ server_rejected). Each entry is a code ("403") or a code
+	// plus exact reason phrase ("403 Forbidden", case-insensitive). Scripts
+	// reuse 403 for customer-side problems ("Registration Required", "Call
+	// blocked"), so match the phrase your ACL rejections actually send.
+	RejectResponses []string `mapstructure:"reject_responses"`
 }
 
 type DetectorsConfig struct {
@@ -226,7 +232,9 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("enforcer.xdp.enabled", false)
 	v.SetDefault("enforcer.xdp.mode", "")
 	v.SetDefault("enforcer.xdp.standalone", false)
-	v.SetDefault("bans.durations", []string{"5m", "30m", "2h", "24h", "0s"})
+	// No permanent tier by default: a misfiring detector must not be able to
+	// lock a customer out for good. Add "0s" explicitly to opt in.
+	v.SetDefault("bans.durations", []string{"5m", "30m", "2h", "24h"})
 	v.SetDefault("bans.cooldown", "48h")
 	v.SetDefault("bans.check_interval", "30s")
 	v.SetDefault("storage.path", "/var/lib/sipreaper/sipreaper.db")
@@ -236,6 +244,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("ingest.log.format", "kamailio")
 	v.SetDefault("ingest.syslog.listen", "0.0.0.0:1514")
 	v.SetDefault("ingest.pcap.ports", []int{5060, 5061})
+	v.SetDefault("ingest.pcap.reject_responses", []string{"403 Forbidden"})
 	v.SetDefault("notifiers.syslog.enabled", true)
 	v.SetDefault("detectors.server_rejected.enabled", true)
 	v.SetDefault("detectors.server_rejected.max_hits", 1)
@@ -294,6 +303,12 @@ func (c *Config) Validate() error {
 		}
 		if len(c.Ingest.Pcap.Ports) == 0 && c.Ingest.Pcap.BPFFilter == "" {
 			return fmt.Errorf("ingest.pcap: ports or bpf_filter required")
+		}
+		for i, r := range c.Ingest.Pcap.RejectResponses {
+			var code int
+			if _, err := fmt.Sscanf(r, "%d", &code); err != nil || code < 400 || code > 699 {
+				return fmt.Errorf("ingest.pcap.reject_responses[%d] = %q: must start with a 4xx-6xx code", i, r)
+			}
 		}
 	}
 

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/andycol/sipreaper/internal/decision"
 	"github.com/andycol/sipreaper/internal/detect"
 	"github.com/andycol/sipreaper/internal/ingest"
+	"github.com/andycol/sipreaper/internal/localaddr"
 	"github.com/andycol/sipreaper/internal/logging"
 	"github.com/andycol/sipreaper/internal/metrics"
 	"github.com/andycol/sipreaper/internal/models"
@@ -72,6 +74,15 @@ func Run(cfgPath, tokenOverride string) error {
 	if err != nil {
 		return err
 	}
+
+	// The host's own addresses are always whitelisted and excluded from pcap
+	// attribution, so sipreaper can never ban the SIP server it runs on.
+	local := localaddr.New()
+	if err := local.Refresh(); err != nil {
+		log.Printf("warning: reading local interface addresses: %v", err)
+	}
+	log.Printf("local addresses (always whitelisted): %v", local.List())
+	wl.SetLocal(local.Contains)
 
 	d := &Daemon{
 		cfg:       cfg,
@@ -143,7 +154,8 @@ func Run(cfgPath, tokenOverride string) error {
 		log.Printf("starting pcap capture: interface=%s ports=%v", cfg.Ingest.Pcap.Interface, cfg.Ingest.Pcap.Ports)
 		pcapCapture = ingest.NewPcapCapture(
 			cfg.Ingest.Pcap.Interface, cfg.Ingest.Pcap.Ports,
-			cfg.Ingest.Pcap.BPFFilter, d.events,
+			cfg.Ingest.Pcap.BPFFilter, cfg.Ingest.Pcap.RejectResponses,
+			local.Contains, d.events,
 		)
 		wg.Add(1)
 		go func() {
@@ -163,6 +175,24 @@ func Run(cfgPath, tokenOverride string) error {
 	} else {
 		log.Println("pcap capture: disabled")
 	}
+
+	// Pick up addresses added after startup (keepalived VIPs, DHCP changes).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := local.Refresh(); err != nil {
+					log.Printf("local address refresh failed: %v", err)
+				}
+			}
+		}
+	}()
 
 	// Start dedup + detection pipeline
 	dedup := ingest.NewDedup(5 * time.Second)
@@ -357,6 +387,14 @@ func Run(cfgPath, tokenOverride string) error {
 	dedup.Stop()
 
 	wg.Wait()
+	// Give queued notifications (email) a moment to go out.
+	for _, n := range d.notifiers {
+		if c, ok := n.(io.Closer); ok {
+			if err := c.Close(); err != nil {
+				log.Printf("notifier %s close: %v", n.Name(), err)
+			}
+		}
+	}
 	log.Println("sipreaper daemon stopped")
 	return nil
 }

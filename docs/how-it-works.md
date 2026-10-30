@@ -101,24 +101,40 @@ A REGISTER UDP packet hits your NIC. Either:
 - **The log tailer goroutine** (`internal/ingest/logtailer.go`) reads
   `/var/log/opensips.log` (or kamailio's) line by line, like `tail -f`, and
   runs each line through both kamailio and opensips regex parsers — they
-  cascade, so a format mismatch never silently drops events.
+  cascade, so a format mismatch never silently drops events. It follows the
+  file like `tail -F`: across logrotate's rename-and-create (it finishes the
+  old file, then reads the new one from the top), across `copytruncate`, and
+  through a file that doesn't exist yet.
 
 Both produce the same internal `models.SIPEvent{}` — IP, method, response code
 (if any), Call-ID, From-User, To-User, User-Agent, source ("pcap" or "log").
 
 ### 3b. Pcap pairs requests with responses
 
-For pcap specifically, requests are stashed by Call-ID into an inflight map
-(capped at 100k entries with FIFO eviction; pruned every minute, 5-minute
-timeout). When a 401 / 403 / 4xx response from your SIP server flies past,
-sipreaper looks it up by Call-ID and synthesises a `Rejected=true` event
-attributed to the **original sender's** IP — not the response's source, which
-is your own server.
+For pcap specifically, requests are stashed by Call-ID + sender IP into an
+inflight map (capped at 100k entries with FIFO eviction; pruned every minute,
+5-minute timeout). A response is attributed to its **destination** — SIP
+sends responses back to the request's sender — and enriched from the
+matching inflight record. The sender is part of the key because a proxy
+reuses the same Call-ID on both legs of a call.
 
-This is the move that gives SIPReaper its highest-confidence signal. Your
-SIP server already decided this request was bad (wrong password, no such
-extension, blocked by ACL). We take that decision and turn it into actionable
-input — without needing the SIP server to log anything.
+Traffic the SIP server originates itself (requests from a local interface
+address, e.g. INVITEs forwarded to carriers or nathelper OPTIONS pings) and
+responses addressed to it (e.g. a carrier's 486) are ignored entirely; they
+say nothing about a remote attacker.
+
+Only some responses are evidence:
+
+- **403 Forbidden** (configurable via `ingest.pcap.reject_responses`) →
+  `Rejected=true`. Your SIP server refused the source (ACL, non-whitelisted
+  carrier). Highest-confidence signal. The reason phrase matters: scripts
+  reuse 403 for customer-side problems like "Registration Required".
+- **401/407** → a failed login *only if* the request already carried
+  `Authorization`/`Proxy-Authorization`. Without credentials it's the normal
+  digest challenge every phone gets on every REGISTER/INVITE, and is dropped.
+- Everything else (other 403s, 404, 405, 483, 486, 487, 503…) is emitted with `IsResponse=true` but
+  is not a rejection. Request-counting detectors skip response events so a
+  call isn't counted once per 100/180/200.
 
 ### 3c. Dedup
 
@@ -166,7 +182,8 @@ log line; this is bounded backpressure, not silent failure).
    nothing. Repeated detections during a ban don't extend it.
 3. **Escalation.** Count this IP's prior bans within the cooldown window
    (default 48h). The number of prior bans picks the duration from
-   `bans.durations`: 1st = 5m, 2nd = 30m, 3rd = 2h, 4th = 24h, 5th+ = permanent.
+   `bans.durations`: 1st = 5m, 2nd = 30m, 3rd = 2h, 4th+ = 24h (append `0`
+   for a permanent tier).
    Repeat offenders get progressively longer bans automatically.
 4. **Persist.** Insert a row into the `bans` table (status `active`, or
    `dry_run` if the engine is in shadow mode).
@@ -190,8 +207,11 @@ The action pipeline runs three things per ban:
 
 2. **Notify.** Each configured notifier gets a copy. `syslog` writes a
    structured line to the system log. `email` sends SMTP if the threat's
-   severity is at or above the configured `min_severity`. Failures in one
-   notifier don't block the others.
+   severity is at or above the configured `min_severity`. Email is queued
+   (100 messages) and sent by a background worker with a 30s limit per
+   message, so a slow or dead mail server never delays a ban; when the queue
+   is full, further mail is dropped and logged. Failures in one notifier
+   don't block the others.
 
 3. **Metric.** `sipreaper_bans_total{detector=...}` and
    `sipreaper_active_bans` are bumped. These are exposed at
@@ -216,7 +236,7 @@ A few non-obvious decisions and the reasoning behind them.
 
 ### Pcap *and* log ingest, both default
 
-Pcap gives you signals the log file doesn't have (e.g., 401 challenges that
+Pcap gives you signals the log file doesn't have (e.g., failed digest logins that
 aren't logged) and works even if your SIP server crashed and stopped writing
 logs. Log ingest catches things pcap can't easily see (e.g., explicit
 "Rejected inbound carrier INVITE from non-whitelisted source" lines from
@@ -460,8 +480,9 @@ Concretely:
   attributes server-side rejections back to the attacker without needing
   the SIP server to log anything.
 - **Escalating bans match real attacker behaviour.** A first-time banned
-  IP gets 5 minutes; the same IP back for a fifth offence gets banned
-  permanently. Persistent attackers run out of road.
+  IP gets 5 minutes; the same IP back again within the cooldown climbs to
+  24h (or a permanent tier, if configured). Persistent attackers run out of
+  road.
 - **Dry-run mode.** Run the whole detection pipeline against real traffic
   for a week, inspect what *would* have been banned, then turn it on. No
   guessing.

@@ -42,18 +42,18 @@ func (e *IPSetEnforcer) Init() error {
 
 	// Make sure the chain exists & is linked from INPUT — same shape as the
 	// iptables enforcer for a smooth swap-over.
-	exec.Command("iptables", "-N", e.chain).Run()
-	if err := exec.Command("iptables", "-C", "INPUT", "-j", e.chain).Run(); err != nil {
-		if err := exec.Command("iptables", "-I", "INPUT", "-j", e.chain).Run(); err != nil {
+	iptablesCmd("-N", e.chain).Run()
+	if err := iptablesCmd("-C", "INPUT", "-j", e.chain).Run(); err != nil {
+		if err := iptablesCmd("-I", "INPUT", "-j", e.chain).Run(); err != nil {
 			return fmt.Errorf("linking chain %s to INPUT: %w", e.chain, err)
 		}
 	}
 
 	// Single match rule: -m set --match-set <name> src -j DROP. Idempotent
 	// thanks to -C / -A pattern.
-	check := exec.Command("iptables", "-C", e.chain, "-m", "set", "--match-set", e.setName, "src", "-j", "DROP")
+	check := iptablesCmd("-C", e.chain, "-m", "set", "--match-set", e.setName, "src", "-j", "DROP")
 	if err := check.Run(); err != nil {
-		if err := exec.Command("iptables", "-A", e.chain, "-m", "set", "--match-set", e.setName, "src", "-j", "DROP").Run(); err != nil {
+		if err := iptablesCmd("-A", e.chain, "-m", "set", "--match-set", e.setName, "src", "-j", "DROP").Run(); err != nil {
 			return fmt.Errorf("adding ipset match rule: %w", err)
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,41 @@ import (
 // overflow eviction kicks in.
 const inflightMaxEntries = 100_000
 
+// rejectMatcher decides which responses mean "the SIP server refused this
+// source" (→ SIPEvent.Rejected, which server_rejected bans on). Ordinary call
+// outcomes — 404, 480, 486, 487, 503, 603… — and digest challenges (401/407)
+// happen on every healthy system and must never be listed.
+type rejectMatcher struct {
+	codes   map[int]bool            // code alone matches any phrase
+	phrases map[int]map[string]bool // code → lower-cased reason phrases
+}
+
+// newRejectMatcher parses entries of the form "403" or "403 Forbidden".
+// Entries are validated by config; anything unparsable is skipped.
+func newRejectMatcher(entries []string) rejectMatcher {
+	m := rejectMatcher{codes: map[int]bool{}, phrases: map[int]map[string]bool{}}
+	for _, e := range entries {
+		fields := strings.SplitN(strings.TrimSpace(e), " ", 2)
+		code, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		if len(fields) == 1 || strings.TrimSpace(fields[1]) == "" {
+			m.codes[code] = true
+			continue
+		}
+		if m.phrases[code] == nil {
+			m.phrases[code] = map[string]bool{}
+		}
+		m.phrases[code][strings.ToLower(strings.TrimSpace(fields[1]))] = true
+	}
+	return m
+}
+
+func (m rejectMatcher) match(code int, reason string) bool {
+	return m.codes[code] || m.phrases[code][strings.ToLower(reason)]
+}
+
 type PcapCapture struct {
 	iface  string
 	ports  []int
@@ -29,9 +65,18 @@ type PcapCapture struct {
 	events chan<- models.SIPEvent
 	done   chan struct{}
 
-	// inflight maps Call-ID → original request metadata so when we observe
-	// the SIP server's 4xx response we can attribute the rejection back to
-	// the original sender (the response packet's destination, not source).
+	// isLocal reports whether an IP belongs to this host. Packets the SIP
+	// server itself sends (requests it forwards to carriers, OPTIONS pings to
+	// phones) and responses it receives to those requests are not evidence
+	// about any remote sender, so they are ignored. nil = nothing is local.
+	isLocal func(net.IP) bool
+
+	rejects rejectMatcher
+
+	// inflight maps Call-ID+sender → original request metadata so when we
+	// observe the SIP server's response we can enrich it (UA, users, whether
+	// credentials were sent). Keyed by sender too because a proxy reuses the
+	// same Call-ID on both legs of a call.
 	inflight   map[string]requestRecord
 	inflightMu sync.Mutex
 
@@ -47,15 +92,22 @@ type requestRecord struct {
 	userAgent string
 	fromUser  string
 	toUser    string
+	hasAuth   bool
 	seen      time.Time
 }
 
-func NewPcapCapture(iface string, ports []int, customFilter string, events chan<- models.SIPEvent) *PcapCapture {
+func inflightKey(callID string, sender net.IP) string {
+	return callID + "|" + sender.String()
+}
+
+func NewPcapCapture(iface string, ports []int, customFilter string, rejectResponses []string, isLocal func(net.IP) bool, events chan<- models.SIPEvent) *PcapCapture {
 	pc := &PcapCapture{
 		iface:    iface,
 		ports:    ports,
 		filter:   buildBPFFilter(ports, customFilter),
 		events:   events,
+		isLocal:  isLocal,
+		rejects:  newRejectMatcher(rejectResponses),
 		done:     make(chan struct{}),
 		inflight: make(map[string]requestRecord),
 	}
@@ -212,17 +264,21 @@ func (pc *PcapCapture) processPacket(packet gopacket.Packet) {
 // out from processPacket so it can be unit-tested without constructing
 // gopacket layers.
 func (pc *PcapCapture) handleSIP(srcIP, dstIP net.IP, msg *SIPMessage) {
-	// Requests: emit normally and stash the request keyed by Call-ID so we
-	// can attribute future responses.
 	if !msg.IsResponse {
+		// A request from this host is the SIP server's own outbound leg.
+		if pc.local(srcIP) {
+			return
+		}
+		// Stash the request so the server's response can be enriched.
 		if msg.CallID != "" {
 			pc.inflightMu.Lock()
 			if len(pc.inflight) >= inflightMaxEntries {
 				pc.evictOldestInflightLocked(inflightMaxEntries / 10)
 			}
-			pc.inflight[msg.CallID] = requestRecord{
+			pc.inflight[inflightKey(msg.CallID, srcIP)] = requestRecord{
 				srcIP: srcIP, method: msg.Method, userAgent: msg.UserAgent,
-				fromUser: msg.FromUser, toUser: msg.ToUser, seen: time.Now(),
+				fromUser: msg.FromUser, toUser: msg.ToUser, hasAuth: msg.HasAuth,
+				seen: time.Now(),
 			}
 			pc.inflightMu.Unlock()
 		}
@@ -236,44 +292,60 @@ func (pc *PcapCapture) handleSIP(srcIP, dstIP net.IP, msg *SIPMessage) {
 		return
 	}
 
-	// Responses: look up the original request and emit a synthesized event
-	// attributed to the *original* sender (not the response's source, which
-	// is our own SIP server).
+	// Responses go back to the request's sender (Via/rport), so the packet's
+	// destination IS the sender we attribute the outcome to. A response
+	// addressed to this host answers a request the server sent itself (e.g. a
+	// carrier's 486) and says nothing about a remote attacker.
 	originIP := dstIP
-	method := msg.Method
-	userAgent := ""
-	fromUser, toUser := "", ""
-	if msg.CallID != "" {
-		pc.inflightMu.Lock()
-		if rec, ok := pc.inflight[msg.CallID]; ok {
-			originIP = rec.srcIP
-			if method == "" {
-				method = rec.method
-			}
-			userAgent = rec.userAgent
-			fromUser = rec.fromUser
-			toUser = rec.toUser
-			// Keep the record around briefly — final responses can be retransmitted.
-		}
-		pc.inflightMu.Unlock()
-	}
-	if originIP == nil {
+	if originIP == nil || pc.local(originIP) {
 		return
 	}
 
-	rejected := msg.ResponseCode >= 400 && msg.ResponseCode < 600
+	method := msg.Method
+	userAgent := ""
+	fromUser, toUser := "", ""
+	var rec requestRecord
+	found := false
+	if msg.CallID != "" {
+		pc.inflightMu.Lock()
+		rec, found = pc.inflight[inflightKey(msg.CallID, originIP)]
+		// Keep the record around briefly — final responses can be retransmitted.
+		pc.inflightMu.Unlock()
+	}
+	if found {
+		if method == "" {
+			method = rec.method
+		}
+		userAgent = rec.userAgent
+		fromUser = rec.fromUser
+		toUser = rec.toUser
+	}
+
+	// 401/407 to a request without credentials is the normal digest
+	// challenge every phone gets on every REGISTER/INVITE. Only a challenge
+	// to a request that already carried credentials is a failed login. If we
+	// never saw the request we can't tell, so assume challenge (don't ban).
+	if (msg.ResponseCode == 401 || msg.ResponseCode == 407) && !(found && rec.hasAuth) {
+		return
+	}
+
+	rejected := pc.rejects.match(msg.ResponseCode, msg.Reason)
 	reason := ""
 	if rejected {
-		reason = fmt.Sprintf("sip server returned %d", msg.ResponseCode)
+		reason = strings.TrimSpace(fmt.Sprintf("sip server returned %d %s", msg.ResponseCode, msg.Reason))
 	}
 
 	evt := models.SIPEvent{
 		Timestamp: time.Now(), SourceIP: originIP, Method: method,
 		UserAgent: userAgent, FromUser: fromUser, ToUser: toUser,
 		CallID: msg.CallID, ResponseCode: msg.ResponseCode, Source: "pcap",
-		Rejected: rejected, RejectReason: reason,
+		IsResponse: true, Rejected: rejected, RejectReason: reason,
 	}
 	pc.send(evt)
+}
+
+func (pc *PcapCapture) local(ip net.IP) bool {
+	return pc.isLocal != nil && pc.isLocal(ip)
 }
 
 func (pc *PcapCapture) send(evt models.SIPEvent) {

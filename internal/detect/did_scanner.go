@@ -34,6 +34,11 @@ func NewDIDScanner(maxDIDs int, window time.Duration) *DIDScanner {
 func (d *DIDScanner) Name() string { return "did_scanner" }
 
 func (d *DIDScanner) Detect(event models.SIPEvent) *models.Threat {
+	// Counts requests; response events would count each call several times.
+	if event.IsResponse {
+		return nil
+	}
+
 	// Only INVITEs attempt to reach a DID; REGISTER/OPTIONS noise would
 	// inflate the count and turn this into a worse copy of user_enum.
 	if event.Method != "INVITE" || event.SourceIP == nil || event.ToUser == "" {

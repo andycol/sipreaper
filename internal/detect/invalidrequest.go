@@ -41,6 +41,11 @@ func NewInvalidRequest(maxInvalid int, window time.Duration) *InvalidRequest {
 func (d *InvalidRequest) Name() string { return "invalid_request" }
 
 func (d *InvalidRequest) Detect(event models.SIPEvent) *models.Threat {
+	// Counts requests; response events would count each call several times.
+	if event.IsResponse {
+		return nil
+	}
+
 	if event.Method != "" && validSIPMethods[event.Method] {
 		return nil
 	}

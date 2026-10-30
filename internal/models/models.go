@@ -17,6 +17,10 @@ type SIPEvent struct {
 	CallID       string    `json:"call_id"`
 	ResponseCode int       `json:"response_code"` // 0 if this is a request
 	Source       string    `json:"source"`        // "log" or "pcap"
+	// IsResponse marks events synthesized from a SIP *response* (pcap only),
+	// attributed back to the request's sender. Detectors that count requests
+	// must skip these or every call is counted once per response (100/180/200…).
+	IsResponse bool `json:"is_response"`
 	// Rejected is true when the SIP server itself explicitly rejected this
 	// request (e.g. "non-whitelisted source", "denied", "forbidden"). This is
 	// a much higher-confidence signal than a raw request count.

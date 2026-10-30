@@ -87,3 +87,18 @@ func TestReloadStatic(t *testing.T) {
 		t.Error("203.0.113.50 should be whitelisted after reload")
 	}
 }
+
+func TestContainsHonoursLocalAddrs(t *testing.T) {
+	wl, _ := newTestWhitelist(t)
+	host := net.ParseIP("203.0.113.10")
+	if wl.Contains(host) {
+		t.Fatal("public host IP whitelisted before SetLocal")
+	}
+	wl.SetLocal(func(ip net.IP) bool { return ip.Equal(host) })
+	if !wl.Contains(host) {
+		t.Error("host's own IP not whitelisted after SetLocal")
+	}
+	if wl.Contains(net.ParseIP("203.0.113.11")) {
+		t.Error("non-local IP whitelisted")
+	}
+}

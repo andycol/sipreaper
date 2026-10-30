@@ -24,6 +24,11 @@ func NewInviteFlood(maxRequests int, window time.Duration) *InviteFlood {
 func (d *InviteFlood) Name() string { return "invite_flood" }
 
 func (d *InviteFlood) Detect(event models.SIPEvent) *models.Threat {
+	// Counts requests; response events would count each call several times.
+	if event.IsResponse {
+		return nil
+	}
+
 	if event.Method != "INVITE" {
 		return nil
 	}

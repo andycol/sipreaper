@@ -26,15 +26,23 @@ var (
 	)
 
 	// OpenSIPS patterns
-	// Specific pattern for the carrier-rejection message that also exposes the DID:
-	// "Rejected inbound carrier INVITE from non-whitelisted source 172.110.223.33 for DID 64300441975359019"
-	opensipsRejectedDIDRe = regexp.MustCompile(
-		`(?i)rejected\b[^\n]*\b(INVITE|REGISTER|OPTIONS|SUBSCRIBE|MESSAGE|NOTIFY|ACK|BYE|CANCEL|UPDATE|REFER|INFO|PRACK)\b[^\n]*?(\d+\.\d+\.\d+\.\d+)[^\n]*?\bDID\s+(\S+)`,
-	)
-	// Generic rejection: "Rejected ... INVITE ... 1.2.3.4 ..."
+	// Access-control rejection, e.g.
+	//   "Rejected inbound carrier INVITE from non-whitelisted source 172.110.223.33 for DID 6430044…"
+	//   "Rejected Teams ingress from non-whitelisted source 1.2.3.4 for INVITE sip:…"
+	// Only lines that say WHY in ACL terms count: scripts also log customer-side
+	// problems as "Rejected …" ("Rejected device INVITE without active
+	// registration"), and those must not ban a customer's site.
 	opensipsRejectedRe = regexp.MustCompile(
-		`(?i)rejected\b.*\b(INVITE|REGISTER|OPTIONS|SUBSCRIBE|MESSAGE|NOTIFY|ACK|BYE|CANCEL|UPDATE|REFER|INFO|PRACK)\b.*?(\d+\.\d+\.\d+\.\d+)`,
+		`(?i)\brejected\b.*\b(non-whitelisted|not whitelisted|not allowed|blacklisted|blocked source|denied|forbidden)\b`,
 	)
+	sipMethodRe = regexp.MustCompile(
+		`\b(INVITE|REGISTER|OPTIONS|SUBSCRIBE|MESSAGE|NOTIFY|ACK|BYE|CANCEL|UPDATE|REFER|INFO|PRACK)\b`,
+	)
+	// The offending address is the one labelled source/from — not whatever
+	// IP happens to appear first (a Call-ID host, an R-URI host…).
+	labelledIPRe = regexp.MustCompile(`(?i)\b(?:source|from|src)[=:\s]+(\d+\.\d+\.\d+\.\d+)`)
+	anyIPRe      = regexp.MustCompile(`\d+\.\d+\.\d+\.\d+`)
+	didRe        = regexp.MustCompile(`\bDID\s+(\S+)`)
 	// "authentication failed for user@domain from 1.2.3.4"
 	opensipsAuthFailRe = regexp.MustCompile(
 		`(?i)authentication failed for (\w[\w.]*)@\S+ from (\d+\.\d+\.\d+\.\d+)`,
@@ -67,7 +75,16 @@ type LogTailer struct {
 	// Periodically log a sample of unmatched lines so operators can spot
 	// patterns the parser is missing. Rate-limited inside Run().
 	debugUnmatched bool
+
+	// pollInterval is the sleep at EOF; rotateCheck is how often, while
+	// idle at EOF, the path is checked for rotation or truncation.
+	pollInterval time.Duration
+	rotateCheck  time.Duration
 }
+
+// maxLogLineLen caps a line held across reads; a "line" that never ends is
+// dropped rather than buffered without limit.
+const maxLogLineLen = 64 * 1024
 
 func NewLogTailer(path, format string, customPatterns []string, events chan<- models.SIPEvent) (*LogTailer, error) {
 	lt := &LogTailer{
@@ -76,6 +93,8 @@ func NewLogTailer(path, format string, customPatterns []string, events chan<- mo
 		events:         events,
 		done:           make(chan struct{}),
 		debugUnmatched: true,
+		pollInterval:   100 * time.Millisecond,
+		rotateCheck:    time.Second,
 	}
 
 	for _, p := range customPatterns {
@@ -89,19 +108,23 @@ func NewLogTailer(path, format string, customPatterns []string, events chan<- mo
 	return lt, nil
 }
 
+// Run tails the log until Stop. It follows the file across rotation: when
+// the path is replaced (logrotate create, or rename and recreate) it finishes
+// the old file and continues from the start of the new one, and when the file
+// is truncated in place (copytruncate) it starts again from the top. A file
+// that doesn't exist yet is waited for.
 func (lt *LogTailer) Run() {
-	f, err := os.Open(lt.path)
-	if err != nil {
-		log.Printf("log tailer: failed to open %s: %v", lt.path, err)
+	f, ok := lt.open(true)
+	if !ok {
 		return
 	}
 	log.Printf("log tailer: tailing %s (format=%s)", lt.path, lt.format)
-	defer f.Close()
-
-	// Seek to end -- we only want new lines
-	f.Seek(0, io.SeekEnd)
+	defer func() { f.Close() }()
 
 	reader := bufio.NewReader(f)
+	var partial strings.Builder
+	lastCheck := time.Now()
+
 	for {
 		select {
 		case <-lt.done:
@@ -109,38 +132,132 @@ func (lt *LogTailer) Run() {
 		default:
 		}
 
-		line, err := reader.ReadString('\n')
+		chunk, err := reader.ReadString('\n')
 		if err != nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		line = strings.TrimRight(line, "\n\r")
-		if line == "" {
-			continue
-		}
-
-		evt := lt.parseLine(line)
-
-		if evt != nil {
-			lt.matchedCount.Add(1)
-			metrics.LogTailerMatched.Inc()
-			evt.Source = "log"
-			select {
-			case lt.events <- *evt:
-			case <-lt.done:
-				return
+			// At EOF the writer may be mid-line: keep what we have and finish
+			// the line on a later read instead of throwing it away.
+			if partial.Len()+len(chunk) <= maxLogLineLen {
+				partial.WriteString(chunk)
+			} else {
+				partial.Reset()
 			}
-		} else {
-			lt.unmatchedCount.Add(1)
-			metrics.LogTailerUnmatched.Inc()
-			if lt.debugUnmatched {
-				// Sample roughly one unmatched line per 100 to avoid spam.
-				if lt.unmatchedCount.Load()%100 == 1 {
-					log.Printf("log tailer: unmatched line (sample): %s", line)
+			if err != io.EOF {
+				log.Printf("log tailer: read %s: %v", lt.path, err)
+			}
+
+			if time.Since(lastCheck) >= lt.rotateCheck {
+				lastCheck = time.Now()
+				if nf, why := lt.checkRotation(f); nf != nil {
+					log.Printf("log tailer: %s %s, reopening", lt.path, why)
+					if nf != f {
+						f.Close()
+						f = nf
+					}
+					reader.Reset(f)
+					partial.Reset()
+					continue
 				}
 			}
+
+			select {
+			case <-lt.done:
+				return
+			case <-time.After(lt.pollInterval):
+			}
+			continue
 		}
+
+		line := chunk
+		if partial.Len() > 0 {
+			partial.WriteString(chunk)
+			line = partial.String()
+			partial.Reset()
+		}
+		lt.handleLine(strings.TrimRight(line, "\n\r"))
+	}
+}
+
+// open opens the log, retrying until it exists or Stop is called. Only a
+// file present at startup is read from the end: one that appears later is new,
+// so all of it is unread.
+func (lt *LogTailer) open(atStartup bool) (*os.File, bool) {
+	warned := false
+	for {
+		f, err := os.Open(lt.path)
+		if err == nil {
+			if atStartup && !warned {
+				f.Seek(0, io.SeekEnd)
+			}
+			return f, true
+		}
+		if !warned {
+			log.Printf("log tailer: waiting for %s: %v", lt.path, err)
+			warned = true
+		}
+		select {
+		case <-lt.done:
+			return nil, false
+		case <-time.After(lt.rotateCheck):
+		}
+	}
+}
+
+// checkRotation is called at EOF, so everything in f has been read. It
+// returns a file to switch to (and why), or nil to keep reading f.
+func (lt *LogTailer) checkRotation(f *os.File) (*os.File, string) {
+	cur, err := f.Stat()
+	if err != nil {
+		return nil, ""
+	}
+	onDisk, err := os.Stat(lt.path)
+	if err != nil {
+		// Renamed away and not yet recreated: keep the old file and look
+		// again next time.
+		return nil, ""
+	}
+
+	if !os.SameFile(cur, onDisk) {
+		nf, err := os.Open(lt.path)
+		if err != nil {
+			return nil, ""
+		}
+		return nf, "was rotated"
+	}
+
+	pos, err := f.Seek(0, io.SeekCurrent)
+	if err == nil && onDisk.Size() < pos {
+		if _, err := f.Seek(0, io.SeekStart); err == nil {
+			// Same descriptor, rewound — hand it back so the reader resets.
+			return f, "was truncated"
+		}
+	}
+	return nil, ""
+}
+
+func (lt *LogTailer) handleLine(line string) {
+	if line == "" {
+		return
+	}
+
+	evt := lt.parseLine(line)
+	if evt == nil {
+		lt.unmatchedCount.Add(1)
+		metrics.LogTailerUnmatched.Inc()
+		if lt.debugUnmatched {
+			// Sample roughly one unmatched line per 100 to avoid spam.
+			if lt.unmatchedCount.Load()%100 == 1 {
+				log.Printf("log tailer: unmatched line (sample): %s", line)
+			}
+		}
+		return
+	}
+
+	lt.matchedCount.Add(1)
+	metrics.LogTailerMatched.Inc()
+	evt.Source = "log"
+	select {
+	case lt.events <- *evt:
+	case <-lt.done:
 	}
 }
 
@@ -192,30 +309,8 @@ func (lt *LogTailer) parseLine(line string) *models.SIPEvent {
 }
 
 func parseOpenSIPSLine(line string) (*models.SIPEvent, error) {
-	// Carrier rejection with DID context — most informative variant.
-	// "Rejected inbound carrier INVITE from non-whitelisted source 172.110.223.33 for DID 64300441975359019"
-	if m := opensipsRejectedDIDRe.FindStringSubmatch(line); m != nil {
-		return &models.SIPEvent{
-			Timestamp:    time.Now(),
-			SourceIP:     net.ParseIP(m[2]),
-			Method:       strings.ToUpper(m[1]),
-			ToUser:       m[3],
-			ResponseCode: 403,
-			Rejected:     true,
-			RejectReason: "non-whitelisted source",
-		}, nil
-	}
-
-	// Generic "Rejected ... METHOD ... IP" without a DID.
-	if m := opensipsRejectedRe.FindStringSubmatch(line); m != nil {
-		return &models.SIPEvent{
-			Timestamp:    time.Now(),
-			SourceIP:     net.ParseIP(m[2]),
-			Method:       strings.ToUpper(m[1]),
-			ResponseCode: 403,
-			Rejected:     true,
-			RejectReason: "rejected by sip server",
-		}, nil
+	if evt := parseOpenSIPSRejected(line); evt != nil {
+		return evt, nil
 	}
 
 	// "authentication failed for user@domain from 1.2.3.4"
@@ -262,6 +357,44 @@ func parseOpenSIPSLine(line string) (*models.SIPEvent, error) {
 	}
 
 	return nil, nil
+}
+
+// parseOpenSIPSRejected handles access-control rejection lines (see
+// opensipsRejectedRe). Returns nil unless the line names a method and an IP.
+func parseOpenSIPSRejected(line string) *models.SIPEvent {
+	m := opensipsRejectedRe.FindStringSubmatch(line)
+	if m == nil {
+		return nil
+	}
+	method := sipMethodRe.FindString(line)
+	if method == "" {
+		return nil
+	}
+	var ip net.IP
+	if lm := labelledIPRe.FindStringSubmatch(line); lm != nil {
+		ip = net.ParseIP(lm[1])
+	} else {
+		ip = net.ParseIP(anyIPRe.FindString(line))
+	}
+	if ip == nil {
+		return nil
+	}
+
+	evt := &models.SIPEvent{
+		Timestamp:    time.Now(),
+		SourceIP:     ip,
+		Method:       method,
+		ResponseCode: 403,
+		Rejected:     true,
+		RejectReason: "rejected by sip server",
+	}
+	if strings.EqualFold(m[1], "non-whitelisted") {
+		evt.RejectReason = "non-whitelisted source"
+	}
+	if dm := didRe.FindStringSubmatch(line); dm != nil {
+		evt.ToUser = dm[1]
+	}
+	return evt
 }
 
 // matchCustomPatterns tries user-defined regex patterns.

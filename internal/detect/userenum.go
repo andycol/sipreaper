@@ -24,6 +24,11 @@ func NewUserEnum(maxExtensions int, window time.Duration) *UserEnum {
 func (d *UserEnum) Name() string { return "user_enum" }
 
 func (d *UserEnum) Detect(event models.SIPEvent) *models.Threat {
+	// Counts requests; response events would count each call several times.
+	if event.IsResponse {
+		return nil
+	}
+
 	if event.Method != "REGISTER" && event.Method != "INVITE" {
 		return nil
 	}

@@ -8,6 +8,13 @@ import (
 	"time"
 )
 
+// iptablesCmd runs iptables with -w so a concurrent caller holding the xtables
+// lock (fail2ban, firewalld, an admin) makes us wait rather than fail outright
+// and silently leave a ban unapplied or a rule un-removed.
+func iptablesCmd(args ...string) *exec.Cmd {
+	return exec.Command("iptables", append([]string{"-w", "10"}, args...)...)
+}
+
 type IPTablesEnforcer struct {
 	chain string
 }
@@ -20,11 +27,11 @@ func (e *IPTablesEnforcer) Name() string { return "iptables" }
 
 func (e *IPTablesEnforcer) Init() error {
 	// Create chain if it doesn't exist
-	exec.Command("iptables", "-N", e.chain).Run()
+	iptablesCmd("-N", e.chain).Run()
 
 	// Ensure chain is linked from INPUT
-	if err := exec.Command("iptables", "-C", "INPUT", "-j", e.chain).Run(); err != nil {
-		if err := exec.Command("iptables", "-I", "INPUT", "-j", e.chain).Run(); err != nil {
+	if err := iptablesCmd("-C", "INPUT", "-j", e.chain).Run(); err != nil {
+		if err := iptablesCmd("-I", "INPUT", "-j", e.chain).Run(); err != nil {
 			return fmt.Errorf("linking chain %s to INPUT: %w", e.chain, err)
 		}
 	}
@@ -33,12 +40,12 @@ func (e *IPTablesEnforcer) Init() error {
 
 func (e *IPTablesEnforcer) Ban(ip net.IP, duration time.Duration, reason string) error {
 	checkArgs := e.checkArgs(ip)
-	if err := exec.Command("iptables", checkArgs...).Run(); err == nil {
+	if err := iptablesCmd(checkArgs...).Run(); err == nil {
 		return nil
 	}
 
 	args := e.banArgs(ip)
-	if err := exec.Command("iptables", args...).Run(); err != nil {
+	if err := iptablesCmd(args...).Run(); err != nil {
 		return fmt.Errorf("iptables ban %s: %w", ip, err)
 	}
 	return nil
@@ -47,13 +54,13 @@ func (e *IPTablesEnforcer) Ban(ip net.IP, duration time.Duration, reason string)
 func (e *IPTablesEnforcer) Unban(ip net.IP) error {
 	checkArgs := e.checkArgs(ip)
 	for removed := 0; removed < 10000; removed++ {
-		if err := exec.Command("iptables", checkArgs...).Run(); err != nil {
+		if err := iptablesCmd(checkArgs...).Run(); err != nil {
 			return nil
 		}
 
 		args := e.unbanArgs(ip)
-		if err := exec.Command("iptables", args...).Run(); err != nil {
-			if checkErr := exec.Command("iptables", checkArgs...).Run(); checkErr != nil {
+		if err := iptablesCmd(args...).Run(); err != nil {
+			if checkErr := iptablesCmd(checkArgs...).Run(); checkErr != nil {
 				return nil
 			}
 			return fmt.Errorf("iptables unban %s: %w", ip, err)
@@ -63,7 +70,7 @@ func (e *IPTablesEnforcer) Unban(ip net.IP) error {
 }
 
 func (e *IPTablesEnforcer) List() ([]BanEntry, error) {
-	out, err := exec.Command("iptables", "-L", e.chain, "-n", "--line-numbers").Output()
+	out, err := iptablesCmd("-L", e.chain, "-n", "--line-numbers").Output()
 	if err != nil {
 		return nil, fmt.Errorf("listing chain %s: %w", e.chain, err)
 	}

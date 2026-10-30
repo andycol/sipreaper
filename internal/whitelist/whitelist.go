@@ -15,6 +15,9 @@ type Whitelist struct {
 	static  []*net.IPNet
 	dynamic []*net.IPNet
 	store   *store.Store
+	// local reports the host's own addresses (see localaddr). They are always
+	// whitelisted so sipreaper can never ban the SIP server it protects.
+	local func(net.IP) bool
 }
 
 func New(staticEntries []config.StaticWhitelistEntry, s *store.Store) (*Whitelist, error) {
@@ -30,9 +33,20 @@ func New(staticEntries []config.StaticWhitelistEntry, s *store.Store) (*Whitelis
 	return wl, nil
 }
 
+// SetLocal installs the host-address check consulted by Contains.
+func (wl *Whitelist) SetLocal(fn func(net.IP) bool) {
+	wl.mu.Lock()
+	wl.local = fn
+	wl.mu.Unlock()
+}
+
 func (wl *Whitelist) Contains(ip net.IP) bool {
 	wl.mu.RLock()
 	defer wl.mu.RUnlock()
+
+	if wl.local != nil && wl.local(ip) {
+		return true
+	}
 
 	for _, n := range wl.static {
 		if n.Contains(ip) {

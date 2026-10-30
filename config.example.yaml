@@ -16,6 +16,11 @@ ingest:
     interface: "eth0"
     ports: [5060, 5061]
     bpf_filter: ""
+    # Responses that mean "the SIP server refused this source" (→ server_rejected).
+    # "CODE" matches any reason phrase; "CODE Phrase" matches that phrase only.
+    # Scripts often reuse 403 for customer problems ("Registration Required",
+    # "Call blocked"), so list the exact phrase your ACL rejections send.
+    reject_responses: ["403 Forbidden"]
 
 # Detection
 detectors:
@@ -36,17 +41,20 @@ detectors:
     enabled: true
     max_invalid: 3
     window: 60s
+  # Bans on a single packet from outside allowed_countries — a customer's
+  # softphone abroad included. Only enable with a generous country list.
   geo_anomaly:
-    enabled: true
+    enabled: false
     allowed_countries: ["GB", "US"]
     geoip_db: "/usr/share/GeoIP/GeoLite2-Country.mmdb"
   user_enum:
     enabled: true
     max_extensions: 10
     window: 60s
-  # Triggers when the SIP server itself has rejected a request (e.g. carrier
-  # source not whitelisted, denied/forbidden). High-confidence signal — defaults
-  # to a single rejection inside the window.
+  # Triggers when the SIP server itself has rejected a request: a "rejected/
+  # denied/forbidden" log line, or a 403 seen on the wire. Digest challenges
+  # (401/407) and ordinary call outcomes (404/486/487/503…) never count.
+  # High-confidence signal — defaults to a single rejection inside the window.
   server_rejected:
     enabled: true
     max_hits: 1
@@ -69,6 +77,8 @@ detectors:
     window: 5m
 
 # Whitelist
+# The host's own interface addresses are always whitelisted automatically.
+# Add carriers, peers, media servers and monitoring here.
 whitelist:
   static:
     - ip: "10.0.0.0/8"
@@ -80,7 +90,9 @@ whitelist:
 
 # Bans
 bans:
-  durations: [5m, 30m, 2h, 24h, 0]
+  # Add 0 (= permanent) as a final tier only once thresholds are proven in
+  # dry_run — a permanent ban on a NAT'd customer office is a support ticket.
+  durations: [5m, 30m, 2h, 24h]
   cooldown: 48h
   check_interval: 30s
 

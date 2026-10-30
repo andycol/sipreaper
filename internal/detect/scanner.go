@@ -31,6 +31,11 @@ func NewScanner(maxProbes int, window time.Duration, knownAgents []string) *Scan
 func (d *Scanner) Name() string { return "scanner" }
 
 func (d *Scanner) Detect(event models.SIPEvent) *models.Threat {
+	// Counts requests; response events would count each call several times.
+	if event.IsResponse {
+		return nil
+	}
+
 	// Known scanner user-agent = immediate threat
 	if event.UserAgent != "" {
 		ua := strings.ToLower(event.UserAgent)

@@ -30,6 +30,11 @@ func NewHoneypot(extensions []string) *Honeypot {
 func (d *Honeypot) Name() string { return "honeypot" }
 
 func (d *Honeypot) Detect(event models.SIPEvent) *models.Threat {
+	// Counts requests; response events would count each call several times.
+	if event.IsResponse {
+		return nil
+	}
+
 	if len(d.extensions) == 0 || event.SourceIP == nil {
 		return nil
 	}

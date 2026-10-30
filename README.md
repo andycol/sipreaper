@@ -9,10 +9,10 @@ For a narrative explanation of how the system works end-to-end and the design ch
 
 - **Dual ingest** — log files (kamailio + opensips formats, auto-cascade) and live packet capture
 - **10 detection engines** — brute force, INVITE flood, scanner, invalid requests, geo-anomaly, user enumeration, **server_rejected**, **honeypot**, **failed_call_ratio**, **did_scanner**
-- **Pcap response pairing** — 4xx responses are attributed back to the original sender via Call-ID, so SIP-server rejections become high-confidence threats automatically
+- **Pcap response pairing** — responses are attributed back to the original sender (Call-ID + sender), so SIP-server rejections (403) and failed logins (401/407 to a request that carried credentials) become threats automatically; normal digest challenges and call outcomes do not
 - **Configurable thresholds** — per-detector enable/disable, rate limits, and time windows
 - **Two-tier whitelist** — static (config file) and dynamic (runtime via CLI/API), supports IPs and CIDRs, with guards against accidentally banning whitelisted IPs and against whitelisting still-banned IPs
-- **Escalating bans** — repeat offenders get progressively longer bans (5m → 30m → 2h → 24h → permanent)
+- **Escalating bans** — repeat offenders get progressively longer bans (5m → 30m → 2h → 24h, optional permanent tier)
 - **Pluggable enforcement** — `iptables` and `ipset` (O(1) lookup), with optional **kernel-side INVITE pre-filter** (`hashlimit`) to absorb floods before userspace
 - **Pluggable notifications** — syslog and email (SMTP) built-in, with severity filtering
 - **Dry-run / shadow mode** — record would-be bans without touching the firewall, for safe threshold tuning against real traffic
@@ -133,7 +133,7 @@ ingest:
     bpf_filter: ""           # optional custom BPF override
 ```
 
-- **Log tailer** reads Kamailio or OpenSIPS log files and extracts SIP events using regex patterns. It tails the file (like `tail -f`) so it only processes new entries.
+- **Log tailer** reads Kamailio or OpenSIPS log files and extracts SIP events using regex patterns. It tails the file (like `tail -F`) so it only processes new entries, and keeps following it through logrotate (rename or `copytruncate`).
 - **Pcap capture** sniffs SIP packets directly off the wire using libpcap. A BPF filter restricts capture to SIP ports.
 - Both can run simultaneously. A deduplication cache (5s window, keyed on Call-ID + Method) prevents the same event being processed twice.
 
@@ -215,15 +215,15 @@ detectors:
 | `invalid_request` | Unknown SIP methods or empty method field | 3 in 60s | medium |
 | `geo_anomaly` | Requests from countries not in the allowed list | any | medium |
 | `user_enum` | Distinct To-User (extension) targets from one IP | 10 in 60s | high |
-| `server_rejected` | SIP server emitted a 4xx / "rejected" log line for this source | 1 in 5m | high |
+| `server_rejected` | SIP server returned a `reject_responses` reply (default `403 Forbidden`), or logged an access-control rejection ("Rejected … non-whitelisted/denied/forbidden …") for this source | 1 in 5m | high |
 | `honeypot` | Traffic to a configured decoy extension | 1 hit | high |
 | `failed_call_ratio` | High failed:total INVITE ratio over a meaningful sample | 80% of 20 in 5m | high |
 | `did_scanner` | One IP targeting many distinct DIDs (called numbers) | 20 DIDs in 5m | high |
 
 The `server_rejected` detector pulls from two sources automatically:
 
-- **Log tailer**: matches OpenSIPS/Kamailio rejection lines (e.g. `Rejected inbound carrier INVITE from non-whitelisted source 1.2.3.4 for DID …`). The parsers cascade — kamailio + opensips are tried for every line regardless of the configured `format` — so a format mismatch no longer silently drops events.
-- **Pcap**: tracks request → final-response pairs by Call-ID. When the SIP server emits a 4xx, sipreaper synthesises an event attributed to the *original sender*, with `Rejected=true`. No log scraping required.
+- **Log tailer**: matches OpenSIPS/Kamailio access-control rejection lines (e.g. `Rejected inbound carrier INVITE from non-whitelisted source 1.2.3.4 for DID …`). A "Rejected" line only counts if it gives an ACL reason (non-whitelisted, not allowed, denied, forbidden…), and the IP is taken from the `source`/`from` label, not the first IP on the line. The parsers cascade — kamailio + opensips are tried for every line regardless of the configured `format` — so a format mismatch no longer silently drops events.
+- **Pcap**: tracks request → response pairs by Call-ID + sender. When the SIP server answers a request with a response listed in `ingest.pcap.reject_responses` (default `403 Forbidden` — code plus exact reason phrase, because scripts reuse 403 for customer-side problems), sipreaper synthesises an event attributed to the *original sender*, with `Rejected=true`. 401/407 challenges to requests without credentials, and ordinary outcomes (404/486/487/503…), are not rejections. Traffic the SIP server itself originates (forwarded INVITEs, OPTIONS keepalives) and responses to it are ignored. No log scraping required.
 
 ### Whitelist
 
@@ -248,7 +248,7 @@ Repeat offenders get progressively longer bans. The escalation counter resets af
 
 ```yaml
 bans:
-  durations: [5m, 30m, 2h, 24h, 0]  # 0 = permanent
+  durations: [5m, 30m, 2h, 24h]     # append 0 for a permanent tier
   cooldown: 48h                       # reset after 48h clean
   check_interval: 30s                 # how often to check for expired bans
 ```
@@ -259,7 +259,7 @@ bans:
 | 2nd ban | 30 minutes |
 | 3rd ban | 2 hours |
 | 4th ban | 24 hours |
-| 5th+ ban | permanent |
+| 5th+ ban | 24 hours (or permanent if `0` is appended) |
 
 ### Enforcement
 
