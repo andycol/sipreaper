@@ -35,9 +35,10 @@ jobs:
   # ONLY the generated Go files, never the .o: object bytes carry debug-info /
   # endianness noise that differs across toolchain patch versions and would
   # cause chronic spurious failures. Pin the clang/llvm/bpftool versions so the
-  # generated Go is reproducible.
+  # generated Go is reproducible. The runner is pinned too: clang-14/llvm-14
+  # aren't packaged on Ubuntu 26.04, which ubuntu-latest moved to in Oct 2026.
   bpf-regen-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CGO_ENABLED: "1"
     steps:
